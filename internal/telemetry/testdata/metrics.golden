@@ -1,0 +1,165 @@
+http.client.request.duration	histogram	s
+	attr server.address bound=10
+	attr http.response.status_code bound=25
+	attr error.type bound=15
+	buckets [0.005 0.01 0.025 0.05 0.1 0.25 0.5 1 2.5 5 10]
+	series 200
+http.server.active_requests	updowncounter	{request}
+	attr http.request.method bound=8
+	attr toft.surface bound=2
+	series 16
+http.server.request.body.size	histogram	By
+	attr http.request.method bound=8
+	attr http.route bound=200
+	attr toft.surface bound=2
+	buckets [1024 8192 65536 262144 1.048576e+06 4.194304e+06 1.6777216e+07 6.7108864e+07 2.68435456e+08]
+	series 602
+http.server.request.duration	histogram	s
+	attr http.request.method bound=8
+	attr http.route bound=200
+	attr http.response.status_code bound=25
+	attr url.scheme bound=2
+	attr toft.surface bound=2
+	attr toft.app.id bound=apps-cap
+	attr error.type bound=15
+	buckets [0.005 0.01 0.025 0.05 0.1 0.25 0.5 1 2.5 5 10]
+	series 8100
+toft.app.log.dropped	counter	{line}
+	attr toft.app.id bound=apps-cap
+	attr reason bound=2
+	series 1000
+toft.app.state.transitions	counter	{transition}
+	attr from bound=8
+	attr to bound=8
+	attr reason bound=10
+	series 100
+toft.app.upstream.duration	histogram	s
+	attr toft.app.id bound=apps-cap
+	attr http.response.status_code bound=25
+	attr error.type bound=15
+	buckets [0.005 0.01 0.025 0.05 0.1 0.25 0.5 1 2.5 5 10]
+	series 2500
+toft.app.wake.duration	histogram	s
+	attr toft.app.id bound=apps-cap
+	attr toft.outcome bound=6
+	buckets [0.005 0.01 0.025 0.05 0.1 0.25 0.5 1 2.5 5 10]
+	series 1500
+toft.apps.by_status	gauge	{app}
+	attr status bound=8
+	series 7
+toft.artifact.operation.duration	histogram	s
+	attr operation bound=4
+	attr backend bound=3
+	attr toft.outcome bound=6
+	buckets [0.005 0.01 0.025 0.05 0.1 0.25 0.5 1 2.5 5 10]
+	series 66
+toft.auth.signin	counter	{attempt}
+	attr toft.provider.kind bound=4
+	attr toft.outcome bound=8
+	series 32
+toft.autodeploy.poll.duration	histogram	s
+	attr toft.outcome bound=6
+	buckets [0.005 0.01 0.025 0.05 0.1 0.25 0.5 1 2.5 5 10]
+	series 6
+toft.autodeploy.skipped	counter	{skip}
+	attr toft.skip_reason bound=8
+	series 8
+toft.build.active	updowncounter	{build}
+	series 1
+toft.build.cache.bytes	gauge	By
+	series 1
+toft.build.duration	histogram	s
+	attr toft.build.phase bound=6
+	attr toft.outcome bound=6
+	attr toft.framework bound=9
+	attr toft.execution_mode bound=2
+	buckets [1 5 15 30 60 120 300 600 1800 3600]
+	series 360
+toft.build.info	gauge	{info}
+	attr version bound=1
+	attr revision bound=1
+	series 1
+toft.build.queue.depth	gauge	{build}
+	series 1
+toft.build.queue.wait	histogram	s
+	buckets [1 5 15 30 60 120 300 600 1800 3600]
+	series 1
+toft.db.pool.connections	gauge	{connection}
+	attr state bound=4
+	series 4
+toft.db.pool.wait.duration	gauge	s
+	series 1
+toft.db.pool.waits	gauge	{wait}
+	series 1
+toft.dependency.feed.age	gauge	s
+	attr toft.dependency.ecosystem bound=4
+	series 4
+toft.dependency.refusals	counter	{refusal}
+	attr toft.dependency.severity bound=6
+	attr toft.dependency.mode bound=3
+	series 18
+toft.dependency.scans	counter	{scan}
+	attr toft.dependency.ecosystem bound=4
+	attr toft.outcome bound=6
+	series 24
+toft.dependency.waivers	counter	{waiver}
+	attr toft.dependency.action bound=2
+	series 2
+toft.deploy.duration	histogram	s
+	attr toft.outcome bound=6
+	attr toft.execution_mode bound=2
+	attr toft.rollback bound=2
+	buckets [1 5 15 30 60 120 300 600 1800 3600]
+	series 24
+toft.gallery.sync.duration	histogram	s
+	attr toft.outcome bound=6
+	buckets [0.005 0.01 0.025 0.05 0.1 0.25 0.5 1 2.5 5 10]
+	series 6
+toft.git.hook.deliveries	counter	{delivery}
+	attr toft.outcome bound=3
+	series 3
+toft.integration.sends	counter	{send}
+	attr kind bound=16
+	attr action bound=4
+	attr toft.outcome bound=5
+	series 40
+toft.job.queue.depth	gauge	{run}
+	series 1
+toft.job.run.duration	histogram	s
+	attr toft.outcome bound=6
+	attr toft.trigger bound=3
+	buckets [1 5 15 30 60 120 300 600 1800 3600]
+	series 18
+toft.job.run.memory.peak	histogram	By
+	attr toft.outcome bound=6
+	buckets [1024 8192 65536 262144 1.048576e+06 4.194304e+06 1.6777216e+07 6.7108864e+07 2.68435456e+08]
+	series 6
+toft.notify.send.duration	histogram	s
+	attr channel bound=17
+	attr audience bound=4
+	attr toft.outcome bound=6
+	buckets [0.005 0.01 0.025 0.05 0.1 0.25 0.5 1 2.5 5 10]
+	series 48
+toft.scheduled.run.duration	histogram	s
+	attr toft.outcome bound=6
+	attr toft.trigger bound=3
+	attr toft.skip_reason bound=8
+	buckets [1 5 15 30 60 120 300 600 1800 3600]
+	series 144
+toft.sweep.duration	histogram	s
+	attr sweep bound=12
+	attr toft.outcome bound=6
+	buckets [1 5 15 30 60 120 300 600 1800 3600]
+	series 72
+toft.sweep.removed	counter	{row}
+	attr sweep bound=12
+	attr subject bound=4
+	series 48
+toft.telemetry.dropped	counter	{item}
+	attr signal bound=3
+	attr reason bound=4
+	series 12
+toft.telemetry.export.failures	counter	{failure}
+	attr signal bound=3
+	attr error.type bound=15
+	series 45

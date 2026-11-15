@@ -1,0 +1,881 @@
+/**
+ * The app's view of itself, and the durable resources mapped to it.
+ *
+ * `toft.app` answers two different kinds of question and it is worth keeping them
+ * apart. *Who am I* — id, slug, name, execution mode — is for the app's own
+ * logs and for building links back to itself. `id` and `slug` are synchronous
+ * properties, because the platform puts them in the environment; the rest are
+ * one cached request, and async. *What may I do* — `can()` — is
+ * the one that changes how an app should be written:
+ *
+ *   if (await toft.app.can("email")) { … } else { renderNotEnabledNotice(); }
+ *
+ * The answer is attached-or-not and never *why* not. The reason is an
+ * administrator's business, and an app is not a principal that gets told about
+ * the install's configuration.
+ *
+ * **Storage is resolved by name, never by path.** Mounted paths are declared so
+ * an administrator can move a resource; an app that hard-codes `/data/reports`
+ * breaks the first time one does. A miss names what actually *is* mounted,
+ * because "no such resource" without the list sends somebody to their
+ * administrator for a fact this process already has.
+ */
+
+import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { inspect } from "node:util";
+
+import { ToftError, fetchStore, noMoreArgs, fileRefusal, onPlatform, putStoreFile, require_, storeRefusal, takeOptions, transport } from "./transport.js";
+
+const ENV_STORAGE = "TOFT_STORAGE";
+const ENV_BASE_PATH = "BASE_PATH";
+
+/**
+ * How long an answer from `/api/v1/app/url` is reused. Short, because the
+ * address moves without a deploy; long enough that a job mailing a thousand
+ * people asks once.
+ */
+export const URL_TTL_MS = 60_000;
+
+const SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/;
+
+/**
+ * Join an app path onto the app's public address — `toft.app.url()`'s rule,
+ * held to sdk/testdata/app-url-vector.json with the other three SDKs.
+ *
+ * A path is the app's, so `/reports/42` and `reports/42` both mean the app's
+ * route, never the host's root. One that already carries the base path — a
+ * run's `statusUrl`, a framework's own URL helper — is not prefixed twice. A
+ * query or fragment is kept. An absolute URL is refused: joining two origins is
+ * never what the caller meant.
+ */
+export function joinAppUrl(publicUrl, basePath, path) {
+  if (typeof path !== "string") {
+    throw refused("bad_request", `url() takes a path, got ${inspect(path)}`, { hint: 'toft.app.url("/reports/42")' });
+  }
+  if (SCHEME.test(path) || path.startsWith("//")) {
+    throw refused("bad_request", `url() was given an absolute URL (${path}), which it would join onto this app's address`,
+      { hint: 'pass the path inside the app, e.g. toft.app.url("/reports/42")' });
+  }
+  if (basePath && path.startsWith(basePath) && ["", "/", "?", "#"].includes(path.slice(basePath.length, basePath.length + 1))) {
+    path = path.slice(basePath.length);
+  }
+  if (path === "" || path[0] === "?" || path[0] === "#" || path[0] !== "/") path = `/${path}`;
+  return publicUrl.replace(/\/+$/, "") + path;
+}
+
+/** This app, as the platform sees it. */
+export class App {
+  #view = null;
+  #address = null;
+  #addressAt = 0;
+
+  // Fetched once and cached for the life of the process: it is read on hot
+  // paths and an administrator's change lands at the next deploy anyway.
+  // `refresh()` re-reads it for a long-lived app that would rather notice
+  // sooner.
+  async #load() {
+    return (this.#view ??= (await transport().get("/api/v1/app/self")) ?? {});
+  }
+
+  refresh() {
+    noMoreArgs("app.refresh()", arguments, 0, "toft.app.refresh()");
+    this.#view = null;
+    this.#address = null;
+    return this;
+  }
+
+  /**
+   * The absolute address of a page in this app, for a link that leaves it — an
+   * email, a Slack post, a PDF, a ticket. Inside the app's own pages, relative
+   * links built from `basePath()` stay the right tool.
+   *
+   *   await toft.app.url("/reports/42")  // https://apps.example.com/apps/reporter/reports/42
+   *   await toft.app.url()               // the app's front page
+   *   await toft.app.url(run.statusUrl)  // a run's status page
+   *
+   * Asked of the platform rather than stored, and reused for `URL_TTL_MS`: an
+   * administrator can move the install or give the app a hostname of its own
+   * while it runs. Works the same in a request, a job or a schedule. If the
+   * platform cannot be reached the last address this process was told is
+   * used; with none, the error is thrown. An install with no address
+   * configured refuses with `no_public_address`.
+   */
+  async url(path = "") {
+    noMoreArgs("app.url()", arguments, 1, 'await toft.app.url("/reports/42")');
+    if (typeof path !== "string") return joinAppUrl("", "", path);
+    const address = await this.#currentAddress();
+    return joinAppUrl(address.public_url, address.base_path, path);
+  }
+
+  async #currentAddress() {
+    const now = Date.now();
+    if (this.#address && now - this.#addressAt < URL_TTL_MS) return this.#address;
+    let got;
+    try {
+      got = (await transport().get("/api/v1/app/url")) ?? {};
+    } catch (err) {
+      // Unreachable — no status, no code — is the one failure a known address
+      // outlives. A refusal is the platform's answer and stands.
+      if (this.#address && err instanceof ToftError && err.status === undefined && !err.code) return this.#address;
+      throw err;
+    }
+    this.#address = { public_url: String(got.public_url ?? ""), base_path: String(got.base_path ?? "") };
+    this.#addressAt = now;
+    return this.#address;
+  }
+
+  /**
+   * This app's id and slug, synchronously. Plain facts, so plain properties:
+   * as `async slug()` they were a Promise, and a template literal rendered
+   * `[object Promise]` into every link built from one. The platform injects
+   * both into the process (`TOFT_APP_ID`, `TOFT_APP_SLUG`), so neither needs a
+   * request. Where neither is set they fall back to a view already fetched,
+   * and failing that throw `off_platform` naming the variable — as Python's
+   * and Go's do, whose `id` asks the platform — rather than answering "", which
+   * built `/apps//` into every link and passed every truthiness check wrongly.
+   * `await toft.app.slug` still works, because awaiting a string is the string.
+   */
+  get id() {
+    return process.env.TOFT_APP_ID || this.#view?.id || require_("TOFT_APP_ID");
+  }
+
+  get slug() {
+    return process.env.TOFT_APP_SLUG || this.#view?.slug || require_("TOFT_APP_SLUG");
+  }
+
+  /** The display name — not in the environment, so a request, once. */
+  async name() {
+    noMoreArgs("app.name()", arguments, 0, "await toft.app.name()");
+    return (await this.#load()).name ?? "";
+  }
+
+  /** `shared` or `isolated`. */
+  async mode() {
+    noMoreArgs("app.mode()", arguments, 0, "await toft.app.mode()");
+    return (await this.#load()).mode ?? "";
+  }
+
+  /**
+   * Where this app is mounted, e.g. `/apps/reporter`.
+   *
+   * **Build every link and form action from this**, because a root-absolute URL
+   * asks the platform rather than the app and 404s.
+   *
+   * The platform sends it; `BASE_PATH` in the environment is the fallback, and
+   * it is a fallback rather than the source so that the accessor and the
+   * variable cannot disagree — the variable is the value this same deploy
+   * injected into this process, so it can only answer where an install older
+   * than the field says nothing. Reporting `""` there would be worse than
+   * useless: `""` is also the honest answer on an install that gives each app
+   * its own origin, so nothing an app could check told the two apart.
+   */
+  async basePath() {
+    noMoreArgs("app.basePath()", arguments, 0, "await toft.app.basePath()");
+    return (await this.#load()).base_path ?? (process.env[ENV_BASE_PATH] ?? "").trim();
+  }
+
+  /**
+   * The read-only policy block: the rules this app is judged by — version
+   * retention, whether it may sleep and why. The same block `GET /apps/{id}`
+   * returns, for the same reason it exists there: a platform decision about one
+   * app is visible on that app.
+   */
+  async policy() {
+    noMoreArgs("app.policy()", arguments, 0, "await toft.app.policy()");
+    return (await this.#load()).policy ?? {};
+  }
+
+  /** Every capability an administrator attached, e.g. `email.send`. */
+  async capabilities() {
+    noMoreArgs("app.capabilities()", arguments, 0, "await toft.app.capabilities()");
+    return (await this.#load()).capabilities ?? [];
+  }
+
+  /**
+   * Whether this app holds a capability.
+   *
+   * Takes a full capability (`email.send`) or an integration name (`email`),
+   * which is true when *any* of that integration's actions is attached. Both
+   * spellings are accepted because both are the obvious thing to type, and
+   * guessing wrong should not be a silent false.
+   */
+  async can(capability) {
+    noMoreArgs("app.can()", arguments, 1, 'await toft.app.can("email")');
+    // Refused rather than false: an empty name is a bug in the caller, and a
+    // silent false reads as "not attached" and sends somebody to an
+    // administrator over nothing.
+    if (typeof capability !== "string" || !capability.trim()) {
+      throw refused("bad_request", "can() needs a capability (`email.send`) or an integration name (`email`)",
+        { hint: 'toft.app.can("email")' });
+    }
+    const held = await this.capabilities();
+    return held.includes(capability) || held.some((c) => c.startsWith(`${capability}.`));
+  }
+}
+
+/** One durable resource mapped to this app. */
+export class Mount {
+  constructor(raw) {
+    this.name = raw.name ?? "";
+    this.kind = raw.kind ?? "";
+    // The path as the platform described it, and "" for a store that is not
+    // mounted here. Read through `path`, which refuses rather than handing back
+    // "" — `path.join("", name)` is the working directory, and writing there is
+    // writing into the app's own tree.
+    this.mountPath = raw.path ?? "";
+    this.access = raw.access ?? "read";
+    // Which directory of the resource this mount is rooted at, and "" is the
+    // whole resource. It is here because **two mounts of one resource share a
+    // name**, and the name is how app code locates a resource — so this is what
+    // tells them apart. Deliberately not part of `path`: where a mount appears
+    // stays the administrator's choice.
+    this.folder = raw.folder ?? "";
+  }
+
+  /** Whether this resource is on this workload's filesystem at all. */
+  get mounted() {
+    return this.mountPath !== "";
+  }
+
+  get path() {
+    if (!this.mounted) {
+      throw refused("not_mounted",
+        `${JSON.stringify(this.name)} is not mounted here — on this install the app reaches it ` +
+          `through the platform: use list(), upload(), download() or url()`,
+        { hint: "use upload(), download() or url() — this install reaches the store through the platform" },
+      );
+    }
+    return this.mountPath;
+  }
+
+  /** Whether this mount permits a write at all — every rung above `read`. */
+  get writable() {
+    return this.access !== "read" && this.access !== "";
+  }
+
+  /**
+   * The same fact under the name the other three SDKs and the skill use —
+   * Python's `read_only`, Go's `ReadOnly()`. Without it `m.readOnly` is
+   * `undefined`, which renders as a blank and reads as falsy: a read-only
+   * mount reported as writable by every app that ported the spelling.
+   */
+  get readOnly() {
+    return !this.writable;
+  }
+
+  /**
+   * The documented fields, as Python's and the platform's: `name`, `kind`,
+   * `path` ("" where not mounted — the raw value, since `.path` refuses there),
+   * `access`, `folder`, `read_only` and `mounted`. Without it
+   * `JSON.stringify(mounts())` carried `mountPath` and lost the two derived
+   * facts, which live on the prototype.
+   */
+  toJSON() {
+    return {
+      name: this.name,
+      kind: this.kind,
+      path: this.mountPath,
+      access: this.access,
+      folder: this.folder,
+      read_only: this.readOnly,
+      mounted: this.mounted,
+    };
+  }
+
+  /** What `console.log` prints: the documented fields. */
+  [inspect.custom](depth, options, inspectFn = inspect) {
+    return `Mount ${inspectFn(this.toJSON(), options)}`;
+  }
+
+  /**
+   * Copy a local file into this mount, and resolve to where it landed.
+   *
+   *     await toft.store("reports").put("nightly.parquet", "2026-08.parquet");
+   *
+   * Sugar over the mounted path and nothing more. An app that has the store
+   * mounted already has the folder on its filesystem; this saves it from joining
+   * paths, and calls nothing. Where the store is not mounted — on an install with
+   * no cluster — this refuses, and `upload()` reaches it through the platform
+   * instead, at the same level, under the same mapping.
+   *
+   * The access level is checked here only for a better message. **The mount is
+   * the enforcement**: Mountpoint refuses an unsupported operation, so an app
+   * that tries to replace an object it was granted `write` on fails at the first
+   * wrong call rather than corrupting data slowly.
+   */
+  async put(source, name) {
+    noMoreArgs("put()", arguments, 2, 'await toft.store("reports").put("nightly.parquet", "2026-08.parquet")');
+    checkSource(source, "put()");
+    if (name != null && typeof name !== "string") checkRelativeName(name, "put");
+    const targetName = name ?? path.basename(source);
+    checkRelativeName(targetName, "put");
+
+    if (!this.mounted) {
+      throw refused("not_mounted",
+        `${JSON.stringify(this.name)} is not mounted here, so put() has nowhere to copy to — ` +
+          `use upload(), which reaches it through the platform`,
+        { hint: "use upload(), which reaches the store through the platform" },
+      );
+    }
+    if (!this.writable) {
+      throw refused("insufficient_access",
+        `${JSON.stringify(this.name)} is mounted read-only, so this app cannot write to it. ` +
+          `An administrator sets the access level where the resource is mapped.`,
+        { hint: "ask an administrator for `write` access where the resource is mapped" },
+      );
+    }
+
+    const destination = path.join(this.path, targetName);
+    try {
+      await fs.access(source);
+    } catch (err) {
+      // put()'s first argument is the local file to copy in, the second the
+      // name it lands under — a missing source said only "ENOENT" (BB-082).
+      throw fileRefusal(err, source, "read",
+        `put(source, name) copies the local file ${JSON.stringify(String(source))} into the store, and it ` +
+          "does not exist here — pass the path of a file on this machine first, the name it lands under second");
+    }
+    try {
+      await fs.mkdir(path.dirname(destination), { recursive: true });
+      await fs.copyFile(source, destination);
+    } catch (err) {
+      throw fileRefusal(err, `${source} to ${destination}`, "copy");
+    }
+    return destination;
+  }
+
+  // --- Over the platform's signed URLs, in both modes ---
+  //
+  // These reach a store through /api/v1/app/store whether or not it is
+  // mounted, so an app written against them moves between execution modes
+  // unchanged. The platform signs and never sees the bytes.
+
+  /** One page of what is under `path`; names are relative to it. */
+  async list(listPath = "", options) {
+    const { cursor = "" } = takeOptions("list()", options, ["cursor"], 'mount.list("reports/", { cursor })');
+    if (listPath != null && typeof listPath !== "string") checkRelativeName(listPath, "list");
+    if (listPath) checkRelativeName(listPath.replace(/\/$/, ""), "list");
+    const page =
+      (await transport().get(
+        this.#route("/api/v1/app/store/{slug}/objects", "", { path: listPath, cursor }),
+      )) ?? {};
+    const objects = page.objects ?? [];
+    // Iterable over its objects, as Python's Listing is: `for (const o of
+    // await s.list())` reads the same in both, and `length` is the page's.
+    return {
+      objects,
+      prefixes: page.prefixes ?? [],
+      nextCursor: page.next_cursor ?? "",
+      access: page.access ?? "",
+      length: objects.length,
+      [Symbol.iterator]() {
+        return objects[Symbol.iterator]();
+      },
+    };
+  }
+
+  /**
+   * Upload a local file as `name` (its own name by default). At `write` this
+   * creates new objects only, and an existing name is a refusal that says so.
+   */
+  async upload(source, name) {
+    noMoreArgs("upload()", arguments, 2, 'await toft.store("reports").upload("nightly.parquet", "2026-08.parquet")');
+    checkSource(source, "upload()");
+    if (name != null && typeof name !== "string") checkRelativeName(name, "upload");
+    const target = name || path.basename(source);
+    checkRelativeName(target, "upload");
+    // Streamed, never held: both digests in one pass over the file, then the
+    // file piped to the store with its length declared (security review
+    // 2026-11-14, CS-11). The size is what was hashed, so the digests and the
+    // declared length describe the same bytes.
+    let size = 0;
+    const sha = createHash("sha256");
+    const md5 = createHash("md5");
+    try {
+      for await (const chunk of createReadStream(source)) {
+        sha.update(chunk);
+        md5.update(chunk);
+        size += chunk.length;
+      }
+    } catch (err) {
+      throw fileRefusal(err, source);
+    }
+    const signed = await transport().postJson(this.#route("/api/v1/app/store/{slug}/objects"), {
+      name: target,
+      size,
+      sha256: sha.digest("hex"),
+      md5: md5.digest("hex"),
+    });
+    try {
+      await sendSignedFile(signed, source, size);
+    } catch (err) {
+      // The status the store answers an existing name with is the signer's to
+      // say: 412 where If-None-Match is signed, 403 on an Azure create-only
+      // SAS (code review 2026-11-11, I-5). 412 when an older install says
+      // nothing.
+      if (err instanceof ToftError && err.status === (signed.exists_status || 412)) {
+        throw refused("already_exists",
+          // `write`, not this.access: the store signs at the mapping's level
+          // *now*, and only `write` is refused an existing name — the cached
+          // level was the one the app started with.
+          `${JSON.stringify(target)} already exists in ${JSON.stringify(this.name)}, and this ` +
+            "app's access there is `write`, which creates new objects only",
+          {
+            status: 412,
+            hint: "upload under a new name, or ask an administrator for `full` access where the store is mapped",
+          },
+        );
+      }
+      throw err;
+    }
+    return target;
+  }
+
+  /** Fetch one object's bytes, as a Buffer. */
+  async download(name) {
+    noMoreArgs("download()", arguments, 1, 'await toft.store("reports").download("2026-08.parquet")');
+    try {
+      return await sendSigned(await this.#signGet(name, false, "download"));
+    } catch (err) {
+      if (err instanceof ToftError && err.status === 404) {
+        // The URL is signed for any name; the store is what answers that
+        // nothing is there — the first night of every nightly job.
+        throw refused("not_found",
+          `${JSON.stringify(name)} is not in ${JSON.stringify(this.name)} — nothing has been ` +
+            "put there under that name yet",
+          { status: 404, hint: "list() shows the names that are there" },
+        );
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * A signed GET for one object, to hand to a browser. It lives fifteen
+   * minutes, and anyone holding it reads that object until then — the point for
+   * a download link, and the reason not to log one.
+   */
+  async url(name, options) {
+    const { attachment = false } = takeOptions("url()", options, ["attachment"],
+      'mount.url("report.pdf", { attachment: true })');
+    return (await this.#signGet(name, attachment, "url")).url;
+  }
+
+  /**
+   * A lasting link to one file, for a message somebody opens later.
+   *
+   * **Only people granted this storage can open it.** Grant the recipients the
+   * store (Admin → Storage → its page lists who holds it), or send them
+   * something else: anyone else who opens the link gets "Not found".
+   *
+   * Unlike `url()` it carries no credential and does not expire: it is the
+   * platform's address plus the store and the name, and opening it signs the
+   * reader in and checks their grant at that moment. It opens whatever is at
+   * the name *then* — write a dated name, never a fixed one, if a mailed link
+   * must keep meaning the mailed file. The file need not exist yet. Works on a
+   * store and on a volume on a host root, in a job too.
+   */
+  async link(name) {
+    noMoreArgs("link()", arguments, 1, 'await toft.store("reports").link("2026-11/summary.pdf")');
+    checkRelativeName(name, "link");
+    const route = "/api/v1/app/store/{slug}/link/{name}"
+      .replace("{slug}", encodeURIComponent(this.name))
+      .replace("{name}", encodeName(name));
+    const answer = (await transport().get(`${route}?${new URLSearchParams({ folder: this.folder })}`)) ?? {};
+    return answer.link;
+  }
+
+  /** Delete one object. Needs `full`. */
+  async remove(name) {
+    noMoreArgs("remove()", arguments, 1, 'await toft.store("reports").remove("2026-08.parquet")');
+    checkRelativeName(name, "remove");
+    await sendSigned(await transport().del(this.#route("/api/v1/app/store/{slug}/objects/{name}", name)));
+  }
+
+  async #signGet(name, attachment, call) {
+    checkRelativeName(name, call);
+    const query = attachment ? { disposition: "attachment" } : {};
+    return (
+      (await transport().get(this.#route("/api/v1/app/store/{slug}/objects/{name}", name, query))) ?? {}
+    );
+  }
+
+  // `route` is the platform's route, spelled whole so a reader — and the SDK
+  // contract test — sees which one each call reaches. The folder always
+  // travels, "" included: it names *this* mapping, so a resource mapped twice
+  // is never a question the platform has to ask back.
+  #route(route, name = "", query = {}) {
+    if (this.kind && this.kind !== "store") {
+      throw refused("not_a_store",
+        `${JSON.stringify(this.name)} is a ${this.kind}, which is reached at its path — only ` +
+          `an object store is reached over signed URLs`,
+        { hint: `use toft.storage(${JSON.stringify(this.name)}).path with the ordinary file APIs` },
+      );
+    }
+    const params = new URLSearchParams({ folder: this.folder });
+    for (const [k, v] of Object.entries(query)) if (v) params.set(k, v);
+    const filled = route
+      .replace("{slug}", encodeURIComponent(this.name))
+      .replace("{name}", encodeName(name));
+    return `${filled}?${params}`;
+  }
+}
+
+/**
+ * A refusal this SDK makes itself, carrying the platform's envelope. None of
+ * these is helped by trying again — a mapping, a name or a level is wrong — and
+ * without a body the status rule would call a statusless error retryable, the
+ * answer for a network failure. So each says so, with a code to branch on —
+ * and, where there is a next step, a `hint` naming it. A wrong name gets the one
+ * hint every name refusal shares.
+ */
+function refused(code, message, { hint, ...options } = {}) {
+  if (hint === undefined && code === "invalid_name") hint = NAME_HINT;
+  const body = { code, retryable: false };
+  if (hint) body.hint = hint;
+  return new ToftError(message, { ...options, body });
+}
+
+/**
+ * The local file `put()` and `upload()` read, held to a path string before it
+ * reaches `path.basename` (a TypeError) or `fs.readFile`, which reads a number
+ * as a file descriptor (BB-008).
+ */
+function checkSource(source, call) {
+  if (typeof source !== "string" || !source) {
+    throw refused("bad_request",
+      `${call} needs the path of a local file as a string, got ` +
+        `${source === "" ? '""' : source === null ? "null" : Array.isArray(source) ? "an array" : typeof source}`,
+      { hint: `pass the path of a file on this machine first: ${call.replace("()", "")}("report.csv")` });
+  }
+}
+
+const NAME_HINT = "use a relative name with forward slashes and no '.' or '..' segments";
+
+function encodeName(name) {
+  return name.split("/").map(encodeURIComponent).join("/");
+}
+
+/**
+ * Carry out a signed request against the object store: the signed headers
+ * verbatim, and no Toft header at all — the URL is the whole authorization.
+ */
+/** sendSigned for a local file, streamed (putStoreFile). */
+async function sendSignedFile(signed, file, size) {
+  if (!signed?.url) throw new ToftError("the platform returned no signed URL");
+  let resp;
+  try {
+    resp = await putStoreFile(signed.url, { method: signed.method || "PUT", headers: signed.headers ?? {} }, file, size);
+  } catch (err) {
+    if (err instanceof ToftError) throw err;
+    throw new ToftError(`cannot reach the object store: ${err.message}`);
+  }
+  if (resp.status < 200 || resp.status >= 300) {
+    throw storeRefusal("store_refused", `the object store refused the request: ${resp.status} ${resp.statusText}`,
+      resp.status);
+  }
+}
+
+async function sendSigned(signed, body) {
+  if (!signed?.url) throw new ToftError("the platform returned no signed URL");
+  let resp;
+  try {
+    resp = await fetchStore(signed.url, {
+      method: signed.method || "GET",
+      headers: signed.headers ?? {},
+      body,
+    });
+  } catch (err) {
+    if (err instanceof ToftError) throw err;
+    throw new ToftError(`cannot reach the object store: ${err.message}`);
+  }
+  if (!resp.ok) {
+    throw storeRefusal("store_refused", `the object store refused the request: ${resp.status} ${resp.statusText}`,
+      resp.status);
+  }
+  return Buffer.from(await resp.arrayBuffer());
+}
+
+/**
+ * Refuse a name that would land outside the mount.
+ *
+ * The same discipline the platform applies to an uploaded object's name, for the
+ * same reason: the name is the caller's and the location is not, so a traversal
+ * segment here would write into the app's own filesystem — over its code, in the
+ * worst case — rather than into the storage it was given.
+ */
+// The example each call's not-a-string refusal names, so the hint is the call
+// that was made — download(5) was told to call upload() (BB-109's sweep).
+const NAME_EXAMPLE = {
+  upload: 'upload("local.csv", "reports/2026-08.csv")',
+  put: 'put("local.csv", "reports/2026-08.csv")',
+  download: 'download("reports/2026-08.csv")',
+  url: 'url("reports/2026-08.csv")',
+  remove: 'remove("reports/2026-08.csv")',
+  link: 'link("reports/2026-08.csv")',
+  list: 'list("reports/")',
+};
+
+function checkRelativeName(name, call) {
+  // A name that is not a string — `upload(file, {})` — reached `startsWith`
+  // and escaped as a TypeError, uncoded (BB-008). undefined and null are not
+  // strings either: they were invalid_name "a name is required" (BB-109). The
+  // calls whose name is optional (upload, put, list) default it first.
+  if (typeof name !== "string") {
+    const got = name === null ? "null" : Array.isArray(name) ? "an array" : typeof name;
+    throw refused("bad_request", `${call}()'s object name is a string, got ${got}`,
+      { hint: `pass the name as a string: ${NAME_EXAMPLE[call] ?? `${call}("reports/2026-08.csv")`}` });
+  }
+  if (!name) throw refused("invalid_name", "a name is required");
+  if (name.startsWith("/") || name.endsWith("/")) {
+    throw refused("invalid_name", `a name is relative to the mount, got ${JSON.stringify(name)}`);
+  }
+  if (name.includes("\\")) {
+    throw refused("invalid_name", `a name must use forward slashes, got ${JSON.stringify(name)}`);
+  }
+  for (const segment of name.split("/")) {
+    if (segment === "" || segment === "." || segment === "..") {
+      throw refused("invalid_name",
+        `a name must not contain ${JSON.stringify(segment)} segments, got ${JSON.stringify(name)}`,
+      );
+    }
+  }
+}
+
+/**
+ * Every durable resource mapped to this app, in the order the platform listed
+ * them.
+ *
+ * That order is the platform's `ORDER BY m.path`, which is worth knowing only
+ * because two mounts can share a name: it is stable, and it is not a ranking.
+ * Ask for the one you mean with `{ folder }`.
+ *
+ * Read from the injected environment, which the platform keeps in step with
+ * `GET /api/v1/app/storage` — same shape, so either source resolves to the same
+ * answer. Empty when the variable is absent (off-platform, or nothing mapped);
+ * a value that is not a JSON array is `storage_env_invalid`, as in Python and
+ * R — answering [] there made every mapped resource read as unmapped.
+ */
+export function mounts() {
+  noMoreArgs("mounts()", arguments, 0, "toft.mounts()");
+  const raw = (process.env[ENV_STORAGE] ?? "").trim();
+  if (!raw) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw refused("storage_env_invalid", `${ENV_STORAGE} is not valid JSON: ${err.message}`,
+      { hint: STORAGE_ENV_HINT });
+  }
+  if (!Array.isArray(parsed)) {
+    throw refused("storage_env_invalid",
+      `${ENV_STORAGE} should be a JSON array, got ${parsed === null ? "null" : typeof parsed}`,
+      { hint: STORAGE_ENV_HINT });
+  }
+  // An entry that is not an object — a number, null, a bare string — has no
+  // name, kind or access to be read from, and dropping it left the mapping
+  // silently missing: mounts() said [] and storage() not_mapped.
+  for (const entry of parsed) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw refused("storage_env_invalid",
+        `a ${ENV_STORAGE} entry is not an object with a name, kind and access: ${JSON.stringify(entry)}`,
+        { hint: STORAGE_ENV_HINT });
+    }
+  }
+  const entries = parsed;
+  // The platform writes every entry with a name, a kind and an access level
+  // (and a path, "" for a store reached over signed URLs). An entry missing
+  // one is a hand-written stand-in that would resolve to a mount with empty
+  // facts — refused, as Python, Go and R do.
+  for (const entry of entries) {
+    for (const key of ["name", "kind", "access"]) {
+      const value = entry[key];
+      if (typeof value !== "string" || !value.trim()) {
+        throw refused("storage_env_invalid", `a ${ENV_STORAGE} entry has no ${key}: ${JSON.stringify(entry)}`,
+          { hint: STORAGE_ENV_HINT });
+      }
+    }
+    // Held to the values the platform writes: a kind it does not know is a
+    // mount store() and storage() would each guess at, and an access level it
+    // does not know makes readOnly answer false for a mount nothing granted
+    // write on.
+    for (const [key, allowed] of [["kind", STORAGE_KINDS], ["access", STORAGE_ACCESS]]) {
+      if (!allowed.includes(entry[key])) {
+        throw refused("storage_env_invalid",
+          `a ${ENV_STORAGE} entry's ${key} is ${JSON.stringify(entry[key])}, not one of ` +
+            `${allowed.join(", ")}: ${JSON.stringify(entry)}`,
+          { hint: STORAGE_ENV_HINT });
+      }
+    }
+  }
+  return entries.map((m) => new Mount(m));
+}
+
+const STORAGE_KINDS = ["volume", "store"];
+const STORAGE_ACCESS = ["read", "write", "full"];
+
+const STORAGE_ENV_HINT =
+  "TOFT_STORAGE is a JSON array whose entries each name their name, kind (volume or store) " +
+  "and access (read, write or full), and a path where the resource is mounted — a store reached " +
+  "by signed URL has none; the platform writes it, and a local stand-in needs the same keys";
+
+/**
+ * Hold a folder to the rule an object's name is held to — relative, forward
+ * slashes, no `.` or `..` segments — with "" naming the root. Without it
+ * `storage("x", { folder: ".." })` was not_mapped, "mounted, but not at
+ * folder", a lookup failing where the argument was the fault.
+ */
+function checkFolder(folder, accessor) {
+  const hint = `name a folder of the resource, like toft.${accessor}("drop", { folder: "backup" }), or "" for its root`;
+  if (typeof folder !== "string") {
+    throw refused("invalid_name", `${accessor}()'s folder is a string, got ${typeof folder}`, { hint });
+  }
+  if (!folder) return;
+  if (folder.startsWith("/") || folder.endsWith("/") || folder.includes("\\") ||
+      folder.split("/").some((seg) => seg === "" || seg === "." || seg === "..")) {
+    throw refused("invalid_name",
+      "a folder is a relative path inside the resource, with forward slashes and " +
+        `no '.' or '..' segments, got ${JSON.stringify(folder)}`,
+      { hint });
+  }
+}
+
+/**
+ * Resolve one **store** by name, and — where it is mapped twice — by folder.
+ *
+ * A kind-checked alias of `storage`. Uploads are a store feature end to end —
+ * the CLI command is `toft store`, the grant table refuses a volume — so a reader
+ * never has to remember which kinds are in scope, because the name is the kind.
+ *
+ * `storage()` keeps answering for both kinds, because app code that has a volume
+ * mounted has done nothing wrong.
+ */
+export function store(name, options) {
+  const { folder } = takeOptions("store()", options, ["folder"], `toft.store("drop", { folder: "backup" })`);
+  const mount = resolveMount(name, folder, "store");
+  if (mount.kind && mount.kind !== "store") {
+    throw refused("not_a_store",
+      `${JSON.stringify(name)} is a ${mount.kind}, not a store. A volume is a real ` +
+        `filesystem — write to toft.storage(${JSON.stringify(name)}).path directly, with the ` +
+        `ordinary file APIs.`,
+      { hint: `use toft.storage(${JSON.stringify(name)}).path with the ordinary file APIs` },
+    );
+  }
+  return mount;
+}
+
+/**
+ * Resolve one resource by name, and — where it is mapped twice — by folder.
+ *
+ *     toft.storage("warehouse").path
+ *     toft.storage("drop", { folder: "backup" }).path
+ *
+ * **A name is not always one mount.** A mapping's identity is `(resource, app,
+ * folder)`, so an administrator can map one resource twice: the root read-only
+ * and a folder at `write`, at two paths in one workload. Both arrive under the
+ * same name, and `folder` is what tells them apart.
+ *
+ * So a name matching two mounts, with no folder named, **throws rather than
+ * picking one**. Returning the first was the earlier behaviour and it made the
+ * choice by the alphabetical order of paths an administrator chose — a silent
+ * answer to a question the caller did not know they were asking.
+ *
+ * An absent `folder` means *do not care*, which is the ordinary case and is only
+ * ambiguous when there is genuinely more than one. `folder: ""` names the root.
+ */
+export function storage(name, options) {
+  // `{ fold: "a" }` dropped resolved the resource's root — a different mount,
+  // possibly a writable one, than the folder its caller named.
+  const { folder } = takeOptions("storage()", options, ["folder"], `toft.storage("drop", { folder: "backup" })`);
+  return resolveMount(name, folder, "storage");
+}
+
+/**
+ * `storage`'s body, with the accessor the caller used — `storage` or `store` —
+ * so a refusal names the call to make rather than the other one (drills D17:
+ * `store("x")` was told to call `toft.storage`).
+ */
+function resolveMount(name, folder, accessor) {
+  // Before the mounts are read, as the other three SDKs do: no name is the
+  // caller's mistake, not a resource that is missing.
+  if (!name) {
+    throw refused("invalid_name", `${accessor}() needs the name an administrator gave the resource`,
+      { hint: "pass one of the names toft.mounts() lists" });
+  }
+  // null is "do not care", as Python's None; every other value is checked.
+  if (folder === null) folder = undefined;
+  if (folder !== undefined) checkFolder(folder, accessor);
+  const all = mounts();
+  const named = all.filter((m) => m.name === name);
+
+  if (folder !== undefined) {
+    const exact = named.find((m) => m.folder === folder);
+    if (exact) return exact;
+    if (named.length) {
+      throw refused("not_mapped",
+        `${JSON.stringify(name)} is mounted, but not at folder ${JSON.stringify(folder)}. ` +
+          `Mounted here: ${describeFolders(named)}.`,
+        {
+          hint: `name a mounted folder: toft.${accessor}(${JSON.stringify(name)}, { folder: ` +
+            `${JSON.stringify(named[0].folder)} })`,
+        },
+      );
+    }
+  } else if (named.length === 1) {
+    return named[0];
+  } else if (named.length > 1) {
+    throw refused("ambiguous_mount",
+      `${named.length} mounts are named ${JSON.stringify(name)} — ${describeFolders(named)}. ` +
+        `Name one: toft.${accessor}(${JSON.stringify(name)}, { folder: ` +
+        `${JSON.stringify(named[0].folder)} }).`,
+      {
+        hint: `name the folder: toft.${accessor}(${JSON.stringify(name)}, { folder: ` +
+          `${JSON.stringify(named[0].folder)} })`,
+      },
+    );
+  }
+
+  // Off the platform there is nothing to map, and "ask an administrator" would
+  // send somebody to one over a laptop. Same code as every other call that
+  // needs the platform.
+  // Only with no TOFT_STORAGE (unset or blank): "[]" is the platform saying
+  // nothing is mapped, and that is not_mapped (BB-023).
+  if (!(process.env[ENV_STORAGE] ?? "").trim() && !onPlatform()) {
+    throw refused("off_platform",
+      `${accessor}(${JSON.stringify(name)}) needs the storage Toft maps into a deployed app ` +
+        `(${ENV_STORAGE}) — it only resolves in an app running on the platform`,
+      { offPlatform: true, hint: `set ${ENV_STORAGE} to a JSON array of mounts to stand one in locally` });
+  }
+
+  // Each name once: a resource mapped at two folders is one resource.
+  const available = [...new Set(all.map((m) => m.name))];
+  throw refused("not_mapped",
+    available.length
+      ? `no storage resource called ${JSON.stringify(name)} is mapped to this app. ` +
+        `Mapped here: ${available.join(", ")}.`
+      : `no storage resource called ${JSON.stringify(name)} is mapped to this app, and ` +
+        `in fact none is. An administrator maps durable storage to an app under ` +
+        `Admin → Storage.`,
+    {
+      hint: available.length
+        ? `use one of the names mapped to this app: ${available.join(", ")}`
+        : "ask an administrator to map storage on the app's Storage tab",
+    },
+  );
+}
+
+/**
+ * The folders one name is mounted at, with the level of each.
+ *
+ * The level is in the message because it is usually the reason there are two: a
+ * read corpus and a write drop are the shape this feature exists for, and a
+ * caller who picked the wrong one wants to see that immediately.
+ */
+function describeFolders(named) {
+  return named
+    .map((m) => `folder ${JSON.stringify(m.folder)} at ${m.access || "read"}`)
+    .join(", ");
+}

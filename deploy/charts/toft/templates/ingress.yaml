@@ -1,0 +1,108 @@
+{{- if .Values.ingress.enabled }}
+{{- $twoOrigin := eq (include "toft.singleOrigin" .) "false" }}
+{{- $fullname := include "toft.fullname" . }}
+{{/*
+One Ingress object with a rule per origin, not one object per origin.
+
+With the AWS Load Balancer Controller, separate Ingress objects each provision
+their own ALB unless they share a group.name — so the naive two-object shape
+silently doubles the bill and hands the two origins different addresses. One
+object cannot make that mistake.
+
+The two hostnames are the point. In two-origin mode an app's JavaScript runs on
+its own origin and cannot call /api/v1 as the viewer; collapsing them to one
+name gives that up (ADR §15). The chart lets an install make that trade, but it
+has to say so by setting platform.appsBaseUrl equal to platform.baseUrl.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "toft.labels" . | nindent 4 }}
+  {{- /* inboundCidrs becomes the controller's own allow-list here; toft.validate
+         has already refused a list with no annotation to carry it. */}}
+  {{- $annotations := deepCopy (.Values.ingress.annotations | default dict) }}
+  {{- if eq (include "toft.inboundEnforced" .) "true" }}
+  {{- $_ := set $annotations (include "toft.inboundAnnotation" .) (join "," .Values.ingress.inboundCidrs) }}
+  {{- end }}
+  {{- /* ingress-nginx (and AKS application routing, which is ingress-nginx)
+         refuses a body over 1 MiB and cuts a connection idle for 60 s by
+         default — below a deploy archive (100 MiB), a store upload (5 GiB) and
+         an idle app WebSocket. The platform caps every body itself, so the
+         proxy is told not to. A default, not a rule: a key the operator set
+         under ingress.annotations wins. */}}
+  {{- $class := .Values.ingress.className | default "" }}
+  {{- if or (eq $class "nginx") (eq $class "webapprouting.kubernetes.azure.com") }}
+  {{- range $k, $v := dict "nginx.ingress.kubernetes.io/proxy-body-size" "0" "nginx.ingress.kubernetes.io/proxy-read-timeout" "3600" "nginx.ingress.kubernetes.io/proxy-send-timeout" "3600" }}
+  {{- if not (hasKey $annotations $k) }}
+  {{- $_ := set $annotations $k $v }}
+  {{- end }}
+  {{- end }}
+  {{- end }}
+  {{- with $annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ include "toft.platformHost" . | quote }}
+        {{- if $twoOrigin }}
+        - {{ include "toft.appsHost" . | quote }}
+        {{- end }}
+        {{- range .Values.ingress.appHosts }}
+        - {{ . | quote }}
+        {{- end }}
+      {{- with .Values.ingress.tls.secretName }}
+      # Absent when the controller sources the certificate itself — an ACM ARN
+      # in an annotation, say. Present is the cert-manager path.
+      secretName: {{ . }}
+      {{- end }}
+  {{- end }}
+  rules:
+    - host: {{ include "toft.platformHost" . | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullname }}
+                port:
+                  name: platform
+    {{- if $twoOrigin }}
+    - host: {{ include "toft.appsHost" . | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullname }}
+                port:
+                  name: apps
+    {{- end }}
+    {{- /* Apps on hostnames of their own (ADR: an app host is its own origin).
+         Listed by the operator, never computed: the chart cannot read the
+         database, and a rule is the operator's statement that a name reaches
+         this install. They are served by the apps listener, which is the
+         platform's own on a single-origin install. */}}
+    {{- range .Values.ingress.appHosts }}
+    - host: {{ . | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullname }}
+                port:
+                  name: {{ if $twoOrigin }}apps{{ else }}platform{{ end }}
+    {{- end }}
+{{- end }}

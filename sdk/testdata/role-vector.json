@@ -1,0 +1,9 @@
+{
+  "_comment": "One signed role assertion, computed once and asserted by the platform and by all three SDKs. It is the only thing that turns a change to Toft's signing into a test failure rather than three apps that quietly stop trusting anything. Regenerating it to make a test pass is the mistake this file exists to catch.",
+  "key": "test-role-key",
+  "app_id": "app-a",
+  "role": "editor",
+  "expires_at": 4102444800,
+  "payload": "v1.editor.YXBwLWE.4102444800",
+  "blob": "v1.editor.YXBwLWE.4102444800._PbbKsgiom-iq4UpevV1FC9AsqUTBLf26tXy6GqNjiw"
+}

@@ -1,0 +1,46 @@
+# What the daemon is handed on every build of either image.
+#
+# This file is not `.gitignore` and is not generated from it: `.git` belongs
+# here and not there, and a generated file would hide the one line somebody has
+# to think about. What the two must agree on is the direction — anything large
+# that git ignores is something a build should not be shipping either, and the
+# drift between them is what put 3.3 GB in front of a 20 MB source tree.
+#
+# TestTheBuildContextIsSource (dockerfile_test.go) walks the tree under these
+# rules and fails over a threshold, because a context that grows back makes
+# every build slower and produces no error at all.
+
+# Runtime state, never an input to a build.
+data/
+apps/
+logs/
+tmp/
+.env
+*.db
+
+# Build outputs. internal/spa/dist is rebuilt from the frontend stage and
+# deleted by the backend stage before the copy, so shipping the local one costs
+# 25 MB to be overwritten.
+bin/
+# What `go build .` leaves at the root, which .gitignore already drops.
+/toft
+/dist/
+web/dist/
+internal/spa/dist/
+
+# Dependency trees. Both are reinstalled inside the image from the lockfiles.
+node_modules/
+web/node_modules/
+tests/e2e/.venv/
+
+# Scratch. .dev/ is this box's TMPDIR for Go builds (docs/operations.md), so it
+# is not merely large — it is written *while a build is running*, which makes
+# the context nondeterministic as well as slow.
+.dev/
+tests/e2e/reports/
+**/*.log
+
+# History. Nothing in either build reads a revision.
+.git
+# Claude Code's skills and agent worktrees — whole checkouts of the tree.
+.claude/

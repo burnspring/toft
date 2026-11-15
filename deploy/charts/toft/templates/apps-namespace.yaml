@@ -1,0 +1,66 @@
+{{- if .Values.kube.createAppsNamespace }}
+{{/*
+The namespace split is load-bearing.
+
+The release namespace holds the platform: the binary, its database, its
+identity. It is trusted, runs as root (the agent starts each shared-mode app as its own account), and
+holds the credentials. This one holds every isolated workload — non-root, all
+capabilities dropped, no service-account token, admitted traffic only from the
+platform.
+
+One namespace for all workloads rather than one per app: a namespace per app
+would multiply RBAC and quota objects for no isolation gain, since the network
+policy is per-pod either way.
+*/}}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.kube.appsNamespace }}
+  labels:
+    app.kubernetes.io/managed-by: toft
+    {{- /*
+    The API server's fence, not only the platform's good behaviour. The Role
+    lets the platform create any pod spec here, so whoever holds its token
+    could otherwise create a privileged or hostPath pod and own the node.
+    restricted refuses that and more — root, added capabilities, an
+    unconfined syscall filter — and admits the workload spec internal/kube
+    writes, which kube_test.go's TestWorkloadPodsMeetPodSecurityRestricted
+    holds to it. What restricted does not fence is the PV behind a claim: a
+    persistentVolumeClaim volume is allowed whatever it binds to, and the
+    platform may create PVs. The volume admission policy (vap-volumes.yaml)
+    is what limits those to object-store CSI volumes; before Kubernetes 1.30
+    there is no such policy and that create grant is unfenced.
+    */}}
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+  annotations:
+    # A namespace outlives the release that made it only if something else is
+    # still in it. Helm deletes it on uninstall, which takes every running
+    # workload with it — correct here, and the reason `helm uninstall` is a
+    # deploy-affecting action rather than a tidy-up.
+    helm.sh/resource-policy: ""
+{{- end }}
+---
+{{- if .Values.kube.defaultDenyIngress }}
+{{/*
+Isolated apps are separated from each other at the network level — a large part
+of what an app opts into isolation *for*. Denying ingress by default means the
+backend has to open each path deliberately, so the separation cannot be lost by
+omission.
+
+This needs a CNI that enforces NetworkPolicy. k3s's embedded controller does;
+EKS needs the VPC CNI with network policy enabled, or Calico. A cluster whose
+CNI ignores policy accepts this object and silently enforces nothing.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: {{ .Values.kube.appsNamespace }}
+  labels:
+    {{- include "toft.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+{{- end }}

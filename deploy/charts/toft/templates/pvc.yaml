@@ -1,0 +1,46 @@
+{{- if .Values.persistence.enabled }}
+{{/*
+Release checkouts for shared-mode apps, logs, and the shared npm/uv/Go build
+caches. Isolated releases do not live here — they are fetched from the artifact
+store by the workload itself — but shared ones do, and losing them on a pod
+restart would make every shared app depend on the boot reconciler finding a
+directory that is gone.
+*/}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "toft.fullname" . }}-data
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "toft.labels" . | nindent 4 }}
+spec:
+  accessModes: [{{ .Values.persistence.accessMode }}]
+  {{- if .Values.persistence.storageClass }}
+  storageClassName: {{ .Values.persistence.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size }}
+{{- end }}
+{{- if and .Values.releases.enabled (not .Values.releases.ephemeral) }}
+---
+{{/*
+Shared-mode release trees and host job runs (APPS_DIR, JOB_RUN_DIR), apart from
+/data — see `releases` in values.yaml.
+*/}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "toft.fullname" . }}-releases
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "toft.labels" . | nindent 4 }}
+spec:
+  accessModes: [{{ .Values.releases.accessMode }}]
+  {{- if .Values.releases.storageClass }}
+  storageClassName: {{ .Values.releases.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.releases.size }}
+{{- end }}

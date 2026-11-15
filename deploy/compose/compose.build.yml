@@ -1,0 +1,14 @@
+# Run Toft from source beside Postgres: the platform image is built from this
+# checkout rather than pulled.
+#
+#   cp .env.example .env      # then fill in the secrets it lists
+#   docker compose -f compose.yml -f compose.build.yml up -d --build
+#
+# The build is the repository's Dockerfile (the SPA, then the binary, then the
+# language runtimes), so the first one takes a while. With TOFT_IMAGE left
+# empty the result is tagged toft:<TOFT_VERSION>.
+services:
+  toft:
+    build:
+      context: ../..
+      dockerfile: Dockerfile

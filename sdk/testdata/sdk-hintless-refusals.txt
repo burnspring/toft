@@ -1,0 +1,4 @@
+# SDK-made refusals that carry no hint yet — TestEverySDKMadeRefusalCarriesAHint.
+# file	what. This list only shrinks: give one a hint and regenerate with
+# TOFT_UPDATE_HINTLESS=1. Never add to it by hand.
+

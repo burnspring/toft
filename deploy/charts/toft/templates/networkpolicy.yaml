@@ -1,0 +1,59 @@
+{{- if .Values.networkPolicy.enabled }}
+{{/*
+Who may reach the platform pod (ADR §34). Two rules, and the apps namespace is
+in exactly one of them.
+
+Isolated apps reach the callback port and nothing else. :8080 and :8081 are
+where the ingress controller forwards browsers, and TRUSTED_PROXY_CIDRS believes
+X-Forwarded-* from the controller — on most clusters a range the apps share — so
+an app that could dial :8080 could name the client of a sign-in, a throttle key
+or an audit row. The callback listener serves only /api/v1/runner and
+/api/v1/app, and believes no forwarded header.
+
+Everything else that is a pod — the ingress controller, a Prometheus, Headlamp
+— is admitted on every port by namespace: any namespace but the apps one. No
+ports are listed on that rule so that a scrape port (telemetry.metricsAddr) or a
+future listener is not silently closed.
+
+What is not a pod is admitted only by address, from
+networkPolicy.platformSourceCidrs: an ALB's subnets in IP mode, the nodes when a
+NodePort or LoadBalancer Service is reached through another node. Never a range
+holding app pods: on most CNIs an ipBlock matches pod addresses too, and the
+apps rule above would be moot. Traffic from the pod's own node — the kubelet's
+probes, a port-forward — is always allowed by the NetworkPolicy model and needs
+no rule.
+
+This needs a CNI that enforces NetworkPolicy, as the apps namespace's
+default-deny does. One that ignores it accepts this object and enforces nothing.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "toft.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "toft.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "toft.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: NotIn
+                values: [{{ .Values.kube.appsNamespace | quote }}]
+        {{- range .Values.networkPolicy.platformSourceCidrs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.kube.appsNamespace | quote }}
+      ports:
+        - port: 8082
+          protocol: TCP
+{{- end }}

@@ -1,0 +1,14 @@
+.DS_Store
+.git/
+.gitignore
+*.swp
+*.bak
+*.tmp
+*.orig
+*~
+.project
+.idea/
+.vscode/
+# Environment-specific values belong to the environment that owns them, not to
+# the packaged chart. The ephemeral EKS environment keeps its own.
+values-*.yaml

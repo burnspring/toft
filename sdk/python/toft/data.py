@@ -1,0 +1,283 @@
+"""The app's one JSON document.
+
+Settings and small state that outlive a restart, a redeploy and a rollback, and
+belong to nobody's session::
+
+    settings = toft.data.get() or {"period": "monthly"}
+    toft.data.set({**settings, "period": period})
+
+It sits between the two things that already existed, neither of which fits a
+handful of settings: :func:`toft.scratch_dir` is wiped on every start, and
+mapped storage is durable but is an administrator's separate decision per app.
+This needs nothing switched on — every app has it, because it holds only what the
+app put there and reaches nothing outside the install.
+
+**One document, not a store.** No keys, no listing, no queries, and a cap of
+256 KiB. An app with more than that has outgrown the feature rather than hit a
+limit worth raising, and the platform's refusal says so and names what to use
+instead.
+
+**Never written and cleared are the same state, and both differ from ``{}``.**
+:meth:`Data.get` answers ``None`` for either, which is what lets an app write an
+empty document and mean it.
+
+**Two writers need :meth:`Data.update`.** A ``set()`` is last-write-wins, which
+is right for the single-writer app and silently loses a change when a job and the
+web process both save. ``update()`` reads, applies your change, and writes it
+back under the version it read — retrying if somebody got there first, so the
+other writer's change survives instead of being overwritten.
+"""
+
+from __future__ import annotations
+
+import random
+import time
+from dataclasses import dataclass, replace
+from datetime import datetime
+from typing import Any, Callable
+
+from .errors import ToftError
+from .session import transport
+from .transport import encode_json
+
+# How many times update() re-reads and re-applies before giving up.
+DEFAULT_ATTEMPTS = 5
+# How long, in seconds, one update keeps waiting out rate-limit refusals before
+# raising the last one. A deadline rather than a count, and counted apart from
+# ``attempts``, which are conflicts: a drained limiter is a queue, not a writer,
+# and several writers sharing the app's limiter each wait many times at a
+# Retry-After of a second — thirty waits ran out under four threads. Generous on
+# purpose; the write is the one thing update promises not to lose.
+RATE_LIMIT_TIMEOUT = 300.0
+# The pause when a rate_limited refusal carried no Retry-After.
+RATE_LIMIT_PAUSE = 1.0
+
+
+VERSION_CONFLICT_HINT = ("read the document again and reapply the change to it, or use "
+                         "toft.data.update(fn), which does that on every conflict")
+
+
+class VersionConflict(ToftError):
+    """The document changed under a write that named the version it replaced.
+
+    Carries the version that *is* stored, so recovery is one read rather than a
+    guess. :meth:`Data.update` catches this for you; app code driving
+    :meth:`Data.set` with ``if_version`` catches it itself.
+    """
+
+    def __init__(self, message: str, version: int = 0, **kw: Any) -> None:
+        super().__init__(message, **kw)
+        self.version = version
+
+
+@dataclass
+class Document:
+    """One read of the document, with the platform's two facts about it."""
+
+    #: The document, or None when the app has never written one.
+    data: dict | None = None
+    #: 0 when nothing is stored; the compare-and-set token otherwise.
+    version: int = 0
+    #: When it was last written, or None.
+    updated_at: datetime | None = None
+    #: Its size in bytes, as the platform counted it against the cap.
+    bytes: int = 0
+
+    @property
+    def empty(self) -> bool:
+        """True when nothing has been saved, or it was cleared."""
+        return self.data is None
+
+    @classmethod
+    def from_json(cls, raw: Any) -> "Document":
+        raw = raw or {}
+        stamp = raw.get("updated_at")
+        when: datetime | None = None
+        if isinstance(stamp, str) and stamp:
+            try:
+                when = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            except ValueError:
+                when = None
+        return cls(
+            data=raw.get("data"),
+            version=int(raw.get("version", 0)),
+            updated_at=when,
+            bytes=int(raw.get("bytes", 0)),
+        )
+
+
+class Data:
+    """The app's one JSON document."""
+
+    def get(self) -> dict | None:
+        """The document, or None when the app has never written one."""
+        return self.read().data
+
+    def read(self) -> Document:
+        """The document *and* its version — what :meth:`update` is built on."""
+        return Document.from_json(transport().get("/api/v1/app/data"))
+
+    def set(self, document: dict, if_version: int | None = None) -> Document:
+        """Replace the document.
+
+        ``if_version`` makes the write conditional: it happens only if that is
+        still the stored version, and raises :class:`VersionConflict` otherwise.
+        ``0`` means "only if nothing is stored", which is how an app claims first
+        write without a separate call.
+        """
+        # The one thing checked locally, and not a duplicated platform limit:
+        # ``None`` here would be serialized as ``{}`` and quietly wipe the app's
+        # settings, which is a wrong request rather than a refused one.
+        if not isinstance(document, dict):
+            raise ToftError(
+                "app data holds one JSON object — a list or a bare value has nowhere "
+                'to grow a field later, so wrap it, e.g. {"items": [...]}.',
+                body={"code": "bad_request", "retryable": False,
+                      "hint": 'pass a dict — wrap a list as {"items": [...]}'},
+            )
+        # Encoded here, before transport() can refuse off_platform: a value no
+        # request could carry — NaN, an infinity, an object — is bad_request on
+        # a laptop as it is on the platform, not a complaint about the laptop.
+        encode_json(document)
+        headers = {} if if_version is None else {"If-Match": f'"{if_version}"'}
+        raw = _typed(lambda: transport().put_json("/api/v1/app/data", document, headers))
+        # **The write's answer carries what was written.** The platform's reply
+        # to a PUT is deliberately metadata only — version, timestamp, size —
+        # rather than the document echoed back, so without this the handle came
+        # back with ``data=None``: the value this API reserves for "never
+        # written", handed to a caller who had just written. ``doc =
+        # toft.data.set(...)`` then read ``doc.data`` as empty for a document that
+        # is not.
+        #
+        # Filled from the document that went out rather than by a second read,
+        # which would cost a round trip and could answer with somebody else's
+        # later write.
+        return replace(Document.from_json(raw), data=document)
+
+    def update(
+        self,
+        mutator: Callable[[dict], dict | None],
+        attempts: int = DEFAULT_ATTEMPTS,
+    ) -> Document:
+        """Read, change, write back — without losing a concurrent writer's change.
+
+        ``mutator`` is given the current document (``{}`` when there is none) and
+        may either mutate it in place or return a replacement. The write is
+        conditional on the version that was read, so if somebody else wrote in
+        between, this re-reads and applies your change again rather than
+        overwriting theirs::
+
+            toft.data.update(lambda s: s.update(runs=s.get("runs", 0) + 1))
+
+        A ``rate_limited`` refusal does not spend an attempt: it is waited out,
+        honouring ``Retry-After``, for up to :data:`RATE_LIMIT_TIMEOUT` seconds
+        in all, and only then raised as itself.
+
+        Use :meth:`read` and :meth:`set` directly when "there was nothing here"
+        has to be told apart from "there was an empty document" — that
+        distinction is the one thing ``{}`` papers over.
+        """
+        # Checked before the read, so a wrong argument is a bad_request on a
+        # laptop and on the platform alike, not "'dict' object is not
+        # callable" after a round trip.
+        if not callable(mutator):
+            raise ToftError(
+                f"update() takes a function, got {type(mutator).__name__}",
+                body={"code": "bad_request", "retryable": False,
+                      "hint": "update() takes a function that receives the current document "
+                              "({} when there is none) and either changes it in place or returns "
+                              "the new one, e.g. toft.data.update(lambda d: d.update(runs=d.get(\"runs\", 0) + 1)); "
+                              "to replace the document outright, use toft.data.set({...})"},
+            )
+        last: ToftError | None = None
+        conflicts = 0
+        # A whole number from 1: max(1, "3") was a TypeError, and 0 or -1 was
+        # quietly read as 1 (BB-008's sweep; Node refuses the same).
+        if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
+            raise ToftError(
+                f"attempts is a whole number from 1, got {attempts!r}",
+                body={"code": "bad_request", "retryable": False,
+                      "hint": "toft.data.update(fn, attempts=5)"},
+            )
+        give_up = time.monotonic() + RATE_LIMIT_TIMEOUT
+
+        def limited(exc: ToftError) -> bool:
+            # A rate-limit refusal is waited out and does not spend an attempt:
+            # several writers at once each read and re-read, and on the app's
+            # limiter (burst 10) the lost write was the update's own, the one
+            # thing this method promises not to lose. Retry-After is honoured,
+            # with a little jitter so writers refused together do not all come
+            # back in the same instant and be refused together again.
+            nonlocal last
+            if exc.code != "rate_limited":
+                return False
+            left = give_up - time.monotonic()
+            if left <= 0:
+                return False
+            last = exc
+            pause = exc.retry_after if exc.retry_after is not None else RATE_LIMIT_PAUSE
+            pause = max(pause, 0.0) + random.uniform(0, 0.25)
+            time.sleep(min(pause, left))
+            return True
+
+        while conflicts < attempts:
+            try:
+                current = self.read()
+            except ToftError as exc:
+                if limited(exc):
+                    continue
+                raise
+            working = current.data if current.data is not None else {}
+            changed = mutator(working)
+            try:
+                return self.set(working if changed is None else changed, current.version)
+            except VersionConflict as exc:
+                last = exc
+                conflicts += 1
+            except ToftError as exc:
+                if limited(exc):
+                    continue
+                raise
+        raise ToftError(
+            f"app data changed under {attempts} attempts to update it — something "
+            "is writing it continuously",
+            status=last.status if last else None,
+            retry_after=last.retry_after if last else None,
+            body=last.body if last else None,
+        )
+
+    def clear(self, if_version: int | None = None) -> bool:
+        """Throw the document away, putting the app back to never having one.
+
+        Not the same as writing ``{}``, deliberately: an app that cleared its
+        settings and one that saved an empty document mean different things, and
+        the next read tells them apart. Returns whether there was anything to
+        remove.
+        """
+        headers = {} if if_version is None else {"If-Match": f'"{if_version}"'}
+        raw = _typed(lambda: transport().delete("/api/v1/app/data", headers)) or {}
+        return bool(raw.get("deleted"))
+
+
+def _typed(call: Callable[[], Any]) -> Any:
+    """Give a failed precondition a type.
+
+    So :meth:`Data.update` can retry it and app code can catch it, rather than
+    matching on a status code that other refusals also use.
+    """
+    try:
+        return call()
+    except ToftError as exc:
+        if exc.code == "version_conflict":
+            body = dict(exc.body)
+            # The platform's 412 names the version stored but no next step,
+            # and the step is this SDK's to name.
+            body.setdefault("hint", VERSION_CONFLICT_HINT)
+            raise VersionConflict(
+                str(exc),
+                version=int(exc.body.get("version", 0)),
+                status=exc.status,
+                retry_after=exc.retry_after,
+                body=body,
+            ) from None
+        raise

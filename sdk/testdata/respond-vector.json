@@ -1,0 +1,15 @@
+{
+  "_comment": "respond / Respond / job_respond as the four SDKs must answer it. Each case is a run, as the platform's run JSON the SDK builds its own run from (a JobRun in Go, Node and Python, a toft_run in R), or — where a language's respond takes anything — a bare string standing in for one. The run start() returned answers 202 with Location = its status_url, or 303 there when Accept names text/html; every other case is bad_request with a hint and nothing written. Read beside the storage vector, by the same four runners: sdk/go/storage_env_vector_test.go, sdk/node/test/storage-env-vector.test.js, sdk/python/tests/test_storage_env_vector.py and, for R, sdk/storage_env_vector_r_test.go. Go's Respond is typed, so it skips the string case.",
+  "cases": [
+    {
+      "name": "the run start returned",
+      "run": {"id": "run_1", "job": "export", "status": "queued", "status_url": "https://apps.example.test/apps/demo/_toft/runs/run_1"},
+      "json": {"status": 202, "location": "https://apps.example.test/apps/demo/_toft/runs/run_1"},
+      "html": {"status": 303, "location": "https://apps.example.test/apps/demo/_toft/runs/run_1"}
+    },
+    {"name": "an empty run", "run": {}, "error": "bad_request"},
+    {"name": "a run with only an id", "run": {"id": "run_1"}, "error": "bad_request"},
+    {"name": "a run with only a status page", "run": {"status_url": "https://apps.example.test/apps/demo/_toft/runs/run_1"}, "error": "bad_request"},
+    {"name": "a job name in place of the run", "string": "export", "error": "bad_request"}
+  ]
+}

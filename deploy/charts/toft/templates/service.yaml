@@ -1,0 +1,82 @@
+{{- $twoOrigin := eq (include "toft.singleOrigin" .) "false" }}
+{{/*
+The cluster-internal address. An ingress points here, at the platform and apps
+ports; CALLBACK_URL points here too, at the callback port: a runner reaches the
+platform by this name, never by BASE_URL, which is a browser-facing address that
+may not resolve from a pod. The callback port is the only one the apps
+namespace may reach (networkpolicy.yaml), and it is never on the -external
+Service below — nothing outside the cluster calls it.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "toft.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "toft.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "toft.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: platform
+      port: {{ .Values.service.platformPort }}
+      targetPort: platform
+      protocol: TCP
+    - name: callback
+      port: {{ .Values.service.callbackPort }}
+      targetPort: callback
+      protocol: TCP
+    {{- if $twoOrigin }}
+    # Only in two-origin mode. With APPS_PORT == PORT nothing listens on 8081,
+    # and a published port that refuses every connection is worse than an
+    # absent one.
+    - name: apps
+      port: {{ .Values.service.appsPort }}
+      targetPort: apps
+      protocol: TCP
+    {{- end }}
+{{- if ne .Values.service.type "ClusterIP" }}
+---
+{{/*
+How a browser gets in when there is no ingress controller: a NodePort for the
+single-box install where a host reverse proxy dials the node, or a
+LoadBalancer for a cloud install.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "toft.fullname" . }}-external
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "toft.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "toft.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: platform
+      port: {{ .Values.service.platformPort }}
+      targetPort: platform
+      protocol: TCP
+      {{- if eq .Values.service.type "NodePort" }}
+      nodePort: {{ .Values.service.nodePorts.platform }}
+      {{- end }}
+    {{- if $twoOrigin }}
+    - name: apps
+      port: {{ .Values.service.appsPort }}
+      targetPort: apps
+      protocol: TCP
+      {{- if eq .Values.service.type "NodePort" }}
+      nodePort: {{ .Values.service.nodePorts.apps }}
+      {{- end }}
+    {{- end }}
+{{- end }}

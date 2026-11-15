@@ -1,0 +1,125 @@
+{{- $singleOrigin := eq (include "toft.singleOrigin" .) "true" }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "toft.configMapName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "toft.labels" . | nindent 4 }}
+data:
+  # -- Origins ---------------------------------------------------------------
+  BASE_URL: {{ .Values.platform.baseUrl | quote }}
+  APPS_BASE_URL: {{ .Values.platform.appsBaseUrl | quote }}
+  APPS_PORT: {{ include "toft.appsPort" . | quote }}
+  DEV_INSECURE_COOKIES: {{ include "toft.insecureCookies" . | quote }}
+  TRUSTED_PROXY_CIDRS: {{ .Values.platform.trustedProxyCidrs | quote }}
+  {{- with .Values.platform.publicBaseUrl }}
+  # Where links in email point. No request exists when a notification is
+  # written, which is the whole reason this one is configured rather than
+  # derived; nothing inbound may consult it.
+  PUBLIC_BASE_URL: {{ . | quote }}
+  {{- end }}
+
+  # -- Isolated workloads ----------------------------------------------------
+  #
+  # Only with an artifact store and a runner image (toft.isolatedEnabled): the
+  # binary refuses to start with KUBE_NAMESPACE set and either missing. The
+  # apps namespace and its Role and policies are rendered either way.
+  {{- if .Values.blockAwsMetadata }}
+  BLOCK_AWS_METADATA: "1"
+  {{- end }}
+  {{- if include "toft.isolatedEnabled" . }}
+  KUBE_NAMESPACE: {{ .Values.kube.appsNamespace | quote }}
+  {{- range $family, $image := .Values.runnerImages }}
+  {{- if $image }}
+  RUNNER_IMAGE_{{ $family | upper }}: {{ $image | quote }}
+  {{- end }}
+  {{- end }}
+  {{- range $family, $version := .Values.runnerVersions }}
+  {{- if $version }}
+  RUNNER_{{ $family | upper }}_VERSION: {{ $version | quote }}
+  {{- end }}
+  {{- end }}
+  {{- end }}
+
+  # -- Shared-mode app accounts ----------------------------------------------
+  #
+  # Always emitted, both of them, `""` when off. The platform reads these two as
+  # present-or-absent, and the image sets them itself — so a key omitted here
+  # would leave the image's value standing and `perApp: false` would silently do
+  # nothing. An empty value is how "off" is spelled, and it overrides.
+  APP_USER_PER_APP: {{ ternary "1" "" .Values.appAccounts.perApp | quote }}
+  APP_USER_AUTOCREATE: {{ ternary "1" "" .Values.appAccounts.autoCreate | quote }}
+  APP_USER_GROUP: {{ .Values.appAccounts.group | quote }}
+
+  # -- Artifact store --------------------------------------------------------
+  {{- if .Values.artifactStore.enabled }}
+  ARTIFACT_STORE: {{ .Values.artifactStore.type | quote }}
+  ARTIFACT_BUCKET: {{ .Values.artifactStore.bucket | quote }}
+  {{- if eq .Values.artifactStore.type "azblob" }}
+  ARTIFACT_ACCOUNT: {{ .Values.artifactStore.account | quote }}
+  {{- else }}
+  ARTIFACT_REGION: {{ .Values.artifactStore.region | quote }}
+  AWS_REGION: {{ .Values.artifactStore.region | quote }}
+  {{- end }}
+  {{- end }}
+
+  # -- App storage -----------------------------------------------------------
+  {{- if .Values.appStorage.efs.enabled }}
+  KUBE_STORAGE_CLASS: {{ .Values.appStorage.efs.name | quote }}
+  {{- end }}
+  {{- if .Values.appStorage.s3Files.enabled }}
+  KUBE_S3FILES_STORAGE_CLASS: {{ .Values.appStorage.s3Files.name | quote }}
+  {{- end }}
+  {{- with .Values.appStorage.classes }}
+  KUBE_STORAGE_CLASSES: {{ include "toft.storageClasses" . | quote }}
+  {{- end }}
+  {{- with .Values.sharedStorageRoots }}
+  SHARED_STORAGE_ROOTS: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.appStorage.storeRegion }}
+  KUBE_STORE_REGION: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.appStorage.blob.account }}
+  STORE_ACCOUNT: {{ . | quote }}
+  {{- end }}
+
+  # -- Sign-in bootstrap -----------------------------------------------------
+  #
+  # Seeds the first provider so a fresh install is not left with the built-in
+  # administrator as the only way in. A saved row wins over this.
+  {{- if .Values.auth.github.enabled }}
+  GITHUB_CLIENT_ID: {{ .Values.auth.github.clientId | quote }}
+  {{- end }}
+  {{- if .Values.auth.oidc.enabled }}
+  OIDC_PROVIDER_ID: {{ .Values.auth.oidc.providerId | quote }}
+  OIDC_DISPLAY_NAME: {{ .Values.auth.oidc.displayName | quote }}
+  OIDC_ISSUER: {{ .Values.auth.oidc.issuer | quote }}
+  OIDC_CLIENT_ID: {{ .Values.auth.oidc.clientId | quote }}
+  {{- end }}
+
+  # -- Telemetry -------------------------------------------------------------
+  #
+  # Bootstrap only: a configuration saved in the database wins over this, which
+  # is the opposite of the sign-in providers' precedence and deliberate — nobody
+  # is ever locked out of a collector.
+  {{- if .Values.telemetry.enabled }}
+  {{- with .Values.telemetry.endpoint }}
+  OTEL_EXPORTER_OTLP_ENDPOINT: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.telemetry.metricsAddr }}
+  METRICS_ADDR: {{ . | quote }}
+  {{- end }}
+  {{- end }}
+
+  # -- Logging ---------------------------------------------------------------
+  #
+  # Not conditional, unlike everything above it. There is no "logging disabled"
+  # state to express — the stream exists either way, and these two only decide
+  # whether the agent reading it can parse the access line.
+  LOG_FORMAT: {{ .Values.logging.format | quote }}
+  LOG_LEVEL: {{ .Values.logging.level | quote }}
+
+  {{- range $k, $v := .Values.extraEnv }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}

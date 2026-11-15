@@ -1,0 +1,225 @@
+{{- if .Values.serviceAccount.create }}
+{{/*
+What Toft is allowed to do to the cluster.
+
+Every verb here corresponds to a call in internal/kube, and nothing is
+speculative. Note what is absent: no `update` or `patch` anywhere — the backend
+ensures its own objects exist and otherwise leaves them alone. No `secrets` at
+all: app environments are encrypted in Postgres and travel in the bootstrap
+*response*, never as a Kubernetes object. No nodes, no namespaces, no
+cluster-wide pod access.
+
+There is one cluster-scoped grant, below, and it is a built-in: `tokenreviews`
+is not a namespaced resource, and asking the API server "is this the token you
+issued to that pod" is how the platform verifies a workload's identity instead
+of minting one. It grants access to no object.
+*/}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "toft.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "toft.labels" . | nindent 4 }}
+    {{- with .Values.serviceAccount.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- if .Values.serviceAccount.azureWorkloadIdentity.clientId }}
+    azure.workload.identity/use: "true"
+    {{- end }}
+  {{- if or .Values.serviceAccount.annotations .Values.serviceAccount.azureWorkloadIdentity.clientId }}
+  annotations:
+    {{- with .Values.serviceAccount.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- /* The annotation and the label above come from one value, because Azure needs both
+         and half of them is a pod with no projected token and a 401 on the first Blob
+         call — a Kubernetes mistake that reads as an Azure permissions problem. */ -}}
+    {{- with .Values.serviceAccount.azureWorkloadIdentity.clientId }}
+    azure.workload.identity/client-id: {{ . | quote }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "toft.fullname" . }}-workloads
+  # Scoped to the apps namespace, not the platform's own. Toft has no
+  # business reading the pod it is itself running in.
+  namespace: {{ .Values.kube.appsNamespace }}
+  labels:
+    {{- include "toft.labels" . | nindent 4 }}
+rules:
+  # Service workloads: a pod per release, created and deleted, read back while
+  # waiting for readiness and for metrics, listed for the dashboard.
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [create, get, list, delete]
+  # Logs are the operator's debug view. A workload's own output also travels
+  # home over the callback channel, which survives the pod.
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
+  # The stable address a rescheduled pod keeps. ClusterIP only — Toft stays
+  # in the data path, so there is exactly one authorization implementation.
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [create, delete]
+  # The per-workload ingress policy that makes an app's isolation real, plus the
+  # egress carve-out when BLOCK_AWS_METADATA is set. get and update because
+  # every start re-applies it, so a setting changed since reaches running apps.
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [create, get, update, delete]
+  # One-shot work. A Job rather than a bare pod: it survives node eviction and
+  # carries its own completion semantics.
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [create, get, delete]
+  # Durable storage bindings. Toft creates only the *binding*; the
+  # filesystem and the bucket pre-exist and it holds no credential that could
+  # create either.
+  # `get` is what tells a *live* claim of this name from one still being
+  # deleted, and creating over the second provisions nothing: the name goes
+  # when the old claim finalizes. Reading it back is the only way to know,
+  # `Create` reporting only that the name is taken. Strictly narrower than the
+  # two verbs beside it — a reader of a claim it may already delete learns
+  # nothing new.
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [create, get, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "toft.fullname" . }}-workloads
+  namespace: {{ .Values.kube.appsNamespace }}
+  labels:
+    {{- include "toft.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "toft.fullname" . }}-workloads
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "toft.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- if include "toft.isolatedEnabled" . }}
+---
+{{/*
+PersistentVolumes are cluster-scoped, so this one grant cannot be namespaced.
+
+Rendered wherever the isolated backend runs, not only with EFS: the backend
+offers object stores on every install (the Mountpoint driver is its default),
+blob stores with appStorage.blob.account, and volumes from S3 Files or any
+listed class — and each of them creates, reads or deletes a PV. Without the
+backend nothing calls these verbs.
+
+`create` is needed only for *stores*: the Mountpoint and Blob CSI drivers have
+no dynamic provisioning, so the PV behind an object-store claim is written out
+by hand. `get` and `delete` serve every kind. `patch` is the resource delete
+flipping its own volumes to Delete (ADR §12a), and it is granted **only beside
+the admission policy that fences it** (vap-volumes.yaml): RBAC cannot scope a
+cluster-scoped grant by field, and an unfenced patch plus delete is the ability
+to destroy every volume in the cluster. A cluster without
+ValidatingAdmissionPolicy (before 1.30) gets no patch, and a delete there
+releases and says the data was kept — but it still gets `create`, and there
+that grant is unfenced: nothing but the platform's own code limits which PV it
+may write.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "toft.fullname" . }}-store-volumes
+  labels:
+    {{- include "toft.labels" . | nindent 4 }}
+rules:
+  # `get` for the reason the claim's Role gives, one object up: a volume name
+  # released underneath leaves the claim binding to nothing.
+  - apiGroups: [""]
+    resources: [persistentvolumes]
+    verbs: [create, get, delete]
+  {{- if .Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy" }}
+  # Flipping a deleted resource's own volumes to Delete. Fenced: vap-volumes.yaml.
+  - apiGroups: [""]
+    resources: [persistentvolumes]
+    verbs: [patch]
+  {{- end }}
+  # Read only, and only to tell EFS from Azure Files: both provision from
+  # KUBE_STORAGE_CLASS, and the class's provisioner says which this one is —
+  # and to read whether its driver removes a deleted volume's files.
+  - apiGroups: [storage.k8s.io]
+    resources: [storageclasses]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "toft.fullname" . }}-store-volumes
+  labels:
+    {{- include "toft.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "toft.fullname" . }}-store-volumes
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "toft.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+---
+{{/*
+The workload account, and it exists to be a *name*.
+
+Every isolated workload pod runs as this ServiceAccount and it holds **no RBAC
+whatsoever** — no Role, no binding, nothing. What it is for is the projected
+token each pod mounts: kubelet issues one bound to that pod, scoped to the
+`toft-bootstrap` audience, and rotated before it expires, and the platform
+verifies it with a TokenReview. That is what replaced a bearer token in the pod
+spec, which had to expire, which meant an in-place container restart could never
+succeed.
+
+`automountServiceAccountToken` stays off on every workload pod. Automount grants
+the token whose audience is the API server; the projection grants one the API
+server refuses. A workload pod still holds no credential that works against the
+cluster — which is the property that line always protected.
+
+If this account ever acquires a permission, the audience scoping stops being the
+whole of the argument.
+*/}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: toft-workload
+  namespace: {{ .Values.kube.appsNamespace }}
+  labels:
+    {{- include "toft.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+---
+{{/*
+The one cluster-scoped grant, and it binds a name an administrator recognises.
+
+`system:auth-delegator` is the built-in ClusterRole for exactly this: it grants
+`create` on `tokenreviews` and `subjectaccessreviews` and nothing else, and it is
+held by every admission webhook and aggregated API server on any real cluster.
+Binding the built-in rather than defining a bespoke ClusterRole means what has to
+be approved is one recognisable line rather than a rule set to be read.
+
+It grants access to no object, so the claim above — no nodes, no namespaces, no
+cluster-wide pod access — survives it intact.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "toft.fullname" . }}-auth-delegator
+  labels:
+    {{- include "toft.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "toft.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}

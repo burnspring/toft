@@ -1,0 +1,721 @@
+# Toft — default values.
+#
+# The defaults here describe a *conservative* install: two origins, no ingress,
+# in-cluster Postgres, no object store, no EFS storage class, metadata blocked.
+# Every optional capability is off, because ADR's rule is that absent
+# configuration means the capability is not offered rather than half-offered.
+# At these values apps run in shared mode, inside the platform pod: isolated
+# mode needs both artifactStore and at least one runnerImages entry, and the
+# chart refuses a runner image without a store, or app storage without both.
+#
+# One values file ships beside this one:
+#   values-aks.yaml  the shape of an Azure install (docs/deploy-aks.md)
+#
+# It is a shape rather than an install — every id in it is a placeholder — and
+# what makes it worth having is that it shows how few values a second cloud
+# actually touches: each seam is selected on its own and there is no CLOUD
+# value anywhere in this chart.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  # The registry holding your Toft image — required, with no default. No image
+  # is published for this chart to name: build one from the source with
+  # `docker build -t <registry>/toft:<version> .` and push it where the cluster
+  # can pull from. Nothing else in the chart names the image.
+  repository: ""
+  tag: ""            # defaults to .Chart.AppVersion, which is version.Version
+  # IfNotPresent, because a published tag is immutable: scripts/publish-image.sh
+  # refuses to overwrite one, and no `latest` is published for a pull policy to
+  # chase. Always would re-fetch a manifest on every restart to learn nothing.
+  # Pin `tag` to a digest instead if the install needs that guarantee enforced
+  # rather than promised.
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# -- Origins ------------------------------------------------------------------
+#
+# baseUrl and appsBaseUrl are how a *browser* reaches the two origins. They are
+# the only thing that decides single- vs two-origin mode: setting them equal
+# collapses the boundary and drops APPS_PORT onto PORT, exactly as
+# scripts/k3s.sh has always derived it. Nothing else in this chart re-decides
+# it — see _helpers.tpl.
+#
+# Two distinct hostnames is the shape that preserves the app->platform browser
+# boundary. Collapsing it is a real trade (ADR §15) and an install that makes it
+# should have to say so here rather than inherit it.
+platform:
+  baseUrl: ""        # required, e.g. https://toft.example.com
+  appsBaseUrl: ""    # required; equal to baseUrl means single-origin
+
+  # Cookies carry Secure unless this is true. A browser silently drops a Secure
+  # cookie sent over plain http to a non-localhost host, which presents as a
+  # sign-in that appears to work and then does not — so a baseUrl that is not
+  # https:// switches this on whatever is written here. On an HTTPS install
+  # false is honoured, and it is the default.
+  #
+  # A boolean, and only a boolean: it was a string in chart 0.1.1 and the chart
+  # now refuses one rather than reading "0" as on.
+  insecureCookies: false
+
+  # X-Forwarded-* is believed only from these peers, default none. Behind an
+  # ALB or an nginx ingress the proxy is a pod or an ENI in the VPC — leave this
+  # empty there and the platform will ignore the forwarded scheme and mint
+  # http:// links on an https:// install, which is why the chart refuses an
+  # ingress with this empty or loopback.
+  #
+  # Not loopback by default: nothing legitimate in a pod arrives from loopback
+  # with forwarded headers, and a shared-mode app dialling 127.0.0.1 could then
+  # name its own client address. **A sidecar proxy in the platform pod must now
+  # set this** (to 127.0.0.1/32,::1/128).
+  #
+  # **The range must hold the ingress controller and not the apps namespace.**
+  # Every peer inside it may say who the client is: an isolated app is
+  # untrusted code that reaches the platform's Service directly (CALLBACK_URL),
+  # so a range that also holds app pods lets an app choose the address written
+  # into the access log and audit rows, the key a per-address throttle counts
+  # under, and the trace it lands in. The whole pod CIDR is that range. Narrow
+  # it to the controller's own addresses: on Azure CNI with a pod subnet per
+  # node pool, the subnet of a pool that runs only the controller; behind an
+  # ALB, the ALB's own subnets when they are not the nodes' (the proxy is
+  # outside the cluster there); a controller on host networking, the addresses
+  # of the nodes dedicated to it.
+  #
+  # With networkPolicy.enabled (the default) an app cannot reach the port this
+  # range is believed on: the apps namespace is admitted to the callback port
+  # alone, which believes no forwarded header. A range that cannot be narrowed
+  # then costs only what another pod outside the apps namespace could forge.
+  # With the policy off, or on a CNI that does not enforce it, an app inside
+  # the range can write the address of its choice into the logs — forged
+  # addresses, not access.
+  trustedProxyCidrs: ""
+
+  # Where links in email point. Resolved per send; no request exists when a
+  # notification is written. Empty falls back to baseUrl.
+  publicBaseUrl: ""
+
+# -- Service ------------------------------------------------------------------
+service:
+  # ClusterIP behind an ingress; NodePort for the single-box install where a
+  # host reverse proxy dials the node; LoadBalancer for a cloud install with no
+  # ingress controller.
+  type: ClusterIP
+  platformPort: 8080
+  appsPort: 8081
+  # The workload callback listener (CALLBACK_ADDR): where CALLBACK_URL points,
+  # serving only /api/v1/runner and /api/v1/app. On the ClusterIP Service only —
+  # nothing outside the cluster calls it.
+  callbackPort: 8082
+  nodePorts:
+    platform: 30080
+    apps: 30081
+  annotations: {}
+
+# -- Ingress ------------------------------------------------------------------
+#
+# One Ingress object with a rule per origin. One object rather than two on
+# purpose: with the ALB controller, `group.name` is what makes two Ingresses
+# share one load balancer, and getting it wrong silently doubles the bill.
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+
+  # Who may reach the load balancer at all. This is a network control in front
+  # of authentication, not a replacement for it: sign-in still applies, and this
+  # is what keeps an install off the open internet while it is being tested.
+  #
+  # Nothing in Toft needs unsolicited inbound. Auto-deploy polls the remote
+  # rather than receiving a webhook, and Slack and email are outbound — so an
+  # OAuth callback (which arrives through the operator's own browser) is the only
+  # third-party traffic, and it comes from the same address as the session.
+  #
+  # The chart renders the list into the allow-list annotation of the controller
+  # named by className: `alb` -> alb.ingress.kubernetes.io/inbound-cidrs (the
+  # ALB's security group); `nginx` and AKS's `webapprouting.kubernetes.azure.com`
+  # -> nginx.ingress.kubernetes.io/whitelist-source-range. Any other class
+  # (including an empty one, which is the cluster's default and unknown here) is
+  # refused at render unless inboundCidrsAnnotation names the annotation that
+  # controller enforces — a list that reaches no object is a restriction only
+  # the operator believes in. Do not also set that annotation under
+  # `annotations`; the chart refuses two sources for one rule.
+  #
+  # On `nginx` and `webapprouting.kubernetes.azure.com` the chart also renders
+  # nginx.ingress.kubernetes.io/proxy-body-size "0" and proxy-read-timeout /
+  # proxy-send-timeout "3600": ingress-nginx's defaults (1m, 60 s) refuse a
+  # deploy archive or a store upload with a 413 and cut an idle app WebSocket.
+  # The platform caps every body itself. Set any of the three under
+  # `annotations` and your value is the one rendered.
+  #
+  # An nginx allow-list sees the client's address only when the controller's
+  # Service preserves it (externalTrafficPolicy: Local, or PROXY protocol).
+  # Without that every request arrives from a node address and is refused —
+  # closed, not open, but it reads as an outage.
+  inboundCidrs: []
+  inboundCidrsAnnotation: ""
+
+  # Refuse to render an internet-facing ingress with no source restriction unless
+  # somebody says so out loud. An install that is *meant* to be public sets this.
+  allowPublicInbound: false
+  # Hosts are derived from platform.baseUrl / platform.appsBaseUrl. Set these
+  # only to override, e.g. when the ingress terminates a name that differs from
+  # the browser-facing one.
+  platformHost: ""
+  appsHost: ""
+  # Names an administrator has given apps of their own (Settings → Hostname,
+  # or `toft hostname`). Each becomes a rule routed to the apps listener and,
+  # with tls.enabled, a TLS host — so the certificate must cover it. A wildcard
+  # such as "*.apps.example.com" covers every app under it. Empty by default:
+  # an install that lists none routes exactly as before.
+  appHosts: []
+  tls:
+    enabled: false
+    # Leave empty when the controller sources the certificate itself (an ACM ARN
+    # in an annotation, say). A named secret is the cert-manager path.
+    secretName: ""
+
+# -- Secrets ------------------------------------------------------------------
+#
+# JWT_SECRET, ENCRYPTION_KEY, and the database password.
+#
+# ENCRYPTION_KEY is the only thing that can decrypt this install's app secrets
+# and git tokens. Regenerating it does not fail loudly — it makes every stored
+# secret undecryptable. So: an existing Secret is used untouched if named, and
+# a generated one is read back on upgrade and reused rather than rolled.
+secrets:
+  # Name an externally-managed Secret (ExternalSecrets, SOPS, a sealed secret)
+  # carrying JWT_SECRET, ENCRYPTION_KEY, DATABASE_URL and POSTGRES_PASSWORD.
+  # This is the production answer; generation below is the convenience one.
+  existingSecret: ""
+
+  # Generate on first install and reuse thereafter. The reuse depends on
+  # `lookup`, which returns nothing under `helm template` and `--dry-run` — so a
+  # rendered manifest shows fresh values and must not be applied to a live
+  # install. Set existingSecret for anything you intend to keep.
+  generate: true
+
+  # `helm uninstall` deletes the generated Secret with everything else. An
+  # install whose data must survive uninstall sets this, which stamps
+  # helm.sh/resource-policy: keep. Deliberately OFF by default: on an ephemeral
+  # cluster a kept Secret is a leftover, and there is nothing left to decrypt.
+  retainOnUninstall: false
+
+# -- Encryption backend -------------------------------------------------------
+#
+# By default the key above *is* the key: AES-256-GCM under ENCRYPTION_KEY, which
+# is a supported configuration and not a lesser one. Set a KEK URI and the key
+# that encrypts this install's secrets is instead generated in the cluster,
+# wrapped by a key that never leaves your KMS, and stored wrapped — so a stolen
+# database dump or a stolen disk is useless without the KMS grant.
+#
+# **Presence decides.** Unset means the local key; set means the KMS. There is no
+# mode flag to disagree with it. Resolution happens once at startup: a URI naming
+# an unreachable KMS fails the pod loudly and keeps failing, rather than quietly
+# writing under a local key.
+#
+# No credential goes in the URI — authentication comes from IRSA (annotate the
+# service account below with the role) or from VAULT_TOKEN / Kubernetes auth.
+# An EKS install usually has both a KMS and IRSA already, which is why this is
+# offered here and deliberately not in the one-box compose install.
+#
+# Moving an existing install onto a KMS: set this, keep the old key in
+# ENCRYPTION_KEY (or ENCRYPTION_KEY_OLD) so records written before the move keep
+# reading, restart, then run `toft rotate-key` in the pod to sweep them
+# across. Dropping the old key before that sweep reports done destroys whatever
+# is still under it.
+#
+# encryptionKeyURI: aws-kms://arn:aws:kms:us-east-1:123456789012:alias/toft
+# encryptionKeyURI: hcvault://vault.internal:8200/transit/keys/toft
+# encryptionKeyURI: azurekeyvault://toft-kv.vault.azure.net/keys/toft/8f3b1c2d…
+#
+# The Azure form authenticates through workload identity (see serviceAccount
+# below) and takes the key VERSION, which is not optional: Key Vault resolves a
+# versionless identifier to whatever is current at call time, so rotating in the
+# vault would silently change which key wraps while every record already written
+# still names the old one. It is refused at startup without one.
+encryptionKeyURI: ""
+
+# -- The built-in administrator -----------------------------------------------
+#
+# Every install has one account that needs no identity provider, so that an
+# install with no provider yet — or a broken one — still has a way in.
+builtinAdmin:
+  # Generate the first password into the release Secret.
+  #
+  # This is what makes it RETRIEVABLE, which is the whole point:
+  #
+  #   kubectl -n <ns> get secret <release>-secrets \
+  #     -o jsonpath='{.data.BOOTSTRAP_ADMIN_PASSWORD}' | base64 -d
+  #
+  # It is not a standing backdoor. The credential carries must_change, so the
+  # moment an administrator signs in and replaces it the stored value is stale
+  # and authorizes nothing — and anyone who can read a Secret in this namespace
+  # could already exec into the pod.
+  #
+  # Set false and the server generates one itself and prints it to the log at
+  # first boot. That is the safer-at-rest option and the harder one to recover
+  # from: a log line scrolls away, and the only route back is
+  # `toft local-admin enable`, which needs a shell.
+  generateBootstrapPassword: true
+
+# -- Database -----------------------------------------------------------------
+postgres:
+  # An in-cluster Postgres, single replica, one PVC. This is a *fixture*, not a
+  # production database: no backups, no replication, no failover. A real install
+  # sets enabled=false and points external.databaseUrl at RDS or equivalent.
+  enabled: true
+  image:
+    repository: postgres
+    tag: "17-alpine"
+    pullPolicy: IfNotPresent
+  database: toft
+  username: toft
+  persistence:
+    storageClass: ""     # "" = the cluster default
+    size: 20Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+
+external:
+  # Used when postgres.enabled=false. The URL itself belongs in the Secret named
+  # by secrets.existingSecret — never inline here, where it would land in the
+  # release's stored values in cleartext. This names the key it is stored under
+  # in that Secret; the pod receives it as DATABASE_URL whatever the key is.
+  databaseUrlKey: DATABASE_URL
+
+# -- Platform data ------------------------------------------------------------
+#
+# Release checkouts for shared-mode apps, logs, and the shared npm/uv/Go build
+# caches. Isolated releases are fetched from the artifact store by the workload
+# and do not live here.
+persistence:
+  enabled: true
+  storageClass: ""
+  size: 20Gi
+  # ReadWriteOnce pins the pod to one node — and, on EBS, to one availability
+  # zone. A multi-AZ cluster that wants the platform to reschedule freely needs
+  # a ReadWriteMany class (EFS) here instead, or `releases.ephemeral` below,
+  # which goes wherever the pod goes.
+  accessMode: ReadWriteOnce
+  # With persistence off, /data is an emptyDir, and an emptyDir counts against
+  # the node's ephemeral storage: past it, the kubelet evicts this pod and every
+  # shared app with it. Bounded, so the platform's own disk watermarks
+  # (builder/disk.go) refuse a tree well before the kubelet acts.
+  emptyDirSizeLimit: 20Gi
+
+# -- Release trees -------------------------------------------------------------
+#
+# Shared-mode release checkouts (APPS_DIR) and host job runs (JOB_RUN_DIR) on a
+# volume of their own instead of /data, so app code cannot fill the disk the
+# logs and build caches are on — or the reverse. Off by default, so an upgrade
+# never moves an existing install's trees. With an artifact store every tree is
+# a copy of something the store holds, and the platform restores a missing one
+# on start; without one, these trees are the only copy and the volume must be
+# persistent.
+releases:
+  enabled: false
+  # A generic ephemeral volume instead of a claim of its own: provisioned with
+  # the pod and deleted with it, so it is never pinned to a zone. Needs
+  # artifactStore — every restart restores the estate from it.
+  ephemeral: false
+  storageClass: ""
+  size: 50Gi
+  accessMode: ReadWriteOnce
+
+# -- Object stores ------------------------------------------------------------
+#
+# Absent means the capability is not offered. No bucket, no artifact store, and
+# isolated mode has nowhere to put a release. Isolated mode needs this AND at
+# least one runnerImages entry; a store alone is shared mode with a store.
+artifactStore:
+  enabled: false
+  # s3 (AWS S3, MinIO, Ceph) or azblob (Azure Blob Storage).
+  #
+  # A backend name, never a cloud: there is no CLOUD value in this chart, and an
+  # install may publish releases to Blob while its stores sign against something
+  # else entirely. Each seam is selected on its own.
+  type: s3
+  # The bucket, or on azblob the container. The name does not change with the
+  # backend — renaming what crosses the API, the CLI, the SPA and the audit log
+  # to gain a synonym is churn with a migration attached.
+  bucket: ""
+  # s3 only.
+  region: ""
+  # azblob only, and required by it: the storage account the container lives in.
+  # The service URL is derived from it rather than configured, because an
+  # account and a URL that disagree is a configuration that can be half-applied.
+  # Credentials come from workload identity — see serviceAccount below.
+  account: ""
+
+# The StorageClass Toft provisions app *volumes* from, and the class it
+# writes object-store PVs against.
+appStorage:
+  # EFS access points, one per claim. The access point's root-directory jail IS
+  # the isolation between apps: every workload runs as the same UID, so
+  # filesystem modes cannot tell one app from another.
+  efs:
+    enabled: false
+    # Chart-managed StorageClass. Set create=false to point at one the cluster
+    # already has.
+    create: true
+    name: efs-toft
+    fileSystemId: ""
+    # Retain is the correct answer for any install holding real data: under
+    # Delete, removing a claim destroys the access point and everything in it.
+    # An ephemeral test cluster inverts this — there, Retain is what strands
+    # access points on a filesystem the teardown then cannot delete. Changing it
+    # is a deliberate, install-specific decision; the default is the safe one.
+    reclaimPolicy: Retain
+    # Whether deleting a volume in Toft removes its files (ADR §12a). Retain
+    # stays on the class whatever this says; Toft flips a deleted resource's
+    # own volumes to Delete, and the EFS CSI driver then removes the access
+    # point — and its directory only when the controller runs
+    # `controller.deleteAccessPointRootDir: true`, a setting of the driver that
+    # Toft cannot read. Set this true exactly when it does, **at driver v3.4.1
+    # or later** (chart 4.4.1+): before it, that flag did not check an access
+    # point belonged to the volume's own file system (AWS security bulletin
+    # 2026-099). It becomes the class's toft.dev/delete-removes-data
+    # annotation, and false means a delete says the directory was kept.
+    deleteRemovesData: false
+    # The workload UID (internal/kube.runnerUID). A workload cannot chown what
+    # it mounts, so the access point must already be owned by it.
+    uid: "10001"
+    gid: "10001"
+  # Amazon S3 Files: a general-purpose bucket mounted as a file system with NFS
+  # semantics, through the **same EFS CSI driver**. To an app it is a file
+  # system; to the platform it is also a bucket, which is what lets a file store
+  # take grants and have a Files page for the first time.
+  #
+  # A second class rather than a second parameter on the one above, because the
+  # platform has to know which backing a class provides and a class name cannot
+  # tell it. A resource then names its backing at creation, and the class
+  # follows from that.
+  #
+  # The class itself is the operator's: this chart names one rather than
+  # creating it, because an S3 Files class needs a file system, its mount
+  # targets and its VPC wiring, none of which the chart can see. Leave it empty
+  # and S3 Files is simply not offered — absent, not half-offered.
+  s3Files:
+    enabled: false
+    # The StorageClass an operator created against the S3 Files file system.
+    # reclaimPolicy: Retain there, for the reason it is Retain above.
+    name: ""
+  # Further drives: StorageClasses beyond the two above that volumes may be
+  # created on, one per file system — so two sets of apps can each have an EFS
+  # drive of their own. Admin → Storage offers them by label as a Drive choice.
+  # `backing` is efs, azurefiles or s3files; leave it out for EFS or Azure Files
+  # and Toft reads it from the class, but **S3 Files must say so**, because its
+  # classes use the EFS driver too. Each class is the operator's to create, with
+  # reclaimPolicy: Retain.
+  #
+  #   classes:
+  #     - name: ord-efs
+  #     - name: ord-s3files
+  #       backing: s3files
+  classes: []
+  # Azure Files volumes. There is deliberately **no class variable here**: they
+  # provision from the same KUBE_STORAGE_CLASS as EFS, because a class variable
+  # per cloud is how a configuration surface becomes a matrix. The platform
+  # reads the class's provisioner to tell which one it is.
+  #
+  # So there is nothing to set: enable efs above with an Azure Files class, and
+  # the create form offers Azure Files alone. What is worth knowing is in the copy
+  # on that form and repeated here, because it is the one thing Toft cannot
+  # check: **Azure Files has two protocols and only NFS 4.1 gives real
+  # flock/fcntl locks.** An app keeping SQLite or DuckDB on an SMB share
+  # corrupts it under concurrency, not at the first write. The platform cannot
+  # see through a mount, so it cannot detect which and must not guess.
+  #
+  # Azure Blob object stores. The account the containers live in; empty means
+  # the backing is not offered and the create form does not show it — absent,
+  # not dormant. The blob.csi.azure.com driver has to be installed on the
+  # cluster (`az aks enable-addons --addons azure-keyvault-secrets-provider` is
+  # a different addon; this one is `--enable-blob-driver`).
+  #
+  # blobfuse2 mounts read-only or read-write and has nothing between, so an app
+  # may be attached at read or full and the two middle rungs are refused at
+  # attach time. They stay available over a signed URL, where a SAS can express
+  # them exactly. See docs/invariants.md § App storage.
+  blob:
+    account: ""
+  storeRegion: ""
+
+# -- Shared-mode storage ------------------------------------------------------
+#
+# Durable storage for apps that run as a process rather than a pod. It lives
+# under a directory the *operator* mounted on the host: Toft creates a
+# directory under it, gated by a system group per resource, and never a mount —
+# a privileged mount would need CAP_SYS_ADMIN in a product whose whole posture
+# is that the credential lives below it.
+#
+# Empty means shared-mode storage is not offered and a deploy with mappings is
+# refused with the reason. A chart install has a cluster and normally wants the
+# classes above instead; this exists for the install that also runs shared apps
+# against a filesystem it already mounts.
+#
+# The form is `name=/path` or `name=/path:ro`, comma-separated. A read-only
+# level is a *second operator mount* of the same file system, never a permission
+# Toft applies — so a resource under a `:ro` root can only be mapped at
+# read, and the deploy refuses anything else rather than recording a level
+# nothing enforces.
+sharedStorageRoots: ""
+
+# -- Isolated workloads -------------------------------------------------------
+kube:
+  # The namespace isolated workloads are placed in. Separate from the platform's
+  # own: that one is trusted, holds the credentials and runs as root; this one
+  # runs non-root, drops every capability, and mounts no service-account token.
+  appsNamespace: toft-apps
+  createAppsNamespace: true
+  # Default-deny ingress in the apps namespace, so the backend has to open each
+  # path deliberately and the separation cannot be lost by omission.
+  defaultDenyIngress: true
+
+# -- The platform pod's own ingress ------------------------------------------
+#
+# A NetworkPolicy on the platform pod (templates/networkpolicy.yaml): the apps
+# namespace may reach the callback port and nothing else, so an isolated app
+# cannot dial :8080 and forge X-Forwarded-* from inside the trusted-proxy range.
+# Every pod outside the apps namespace — the ingress controller, a Prometheus —
+# is admitted on every port. Traffic from the pod's own node (the kubelet's
+# probes, a port-forward) is always allowed and needs nothing here.
+networkPolicy:
+  enabled: true
+  # What is not a pod but must reach :8080 and :8081, by address. Required
+  # (the chart refuses an empty list) with an `alb` ingress, whose targets in IP
+  # mode are dialled from the ALB's own subnets, and with service.type
+  # LoadBalancer, where traffic arrives from another node or from the client.
+  # Also needed for a NodePort reached through a node other than the one the pod
+  # runs on, and for a controller on host networking (its nodes' addresses).
+  #
+  # **Never a range that holds app pods.** Most CNIs match an ipBlock against
+  # pod addresses as well (Calico, the VPC CNI's agent, Azure NPM), so the pod
+  # CIDR here would admit every app to :8080 and undo the rule above. Cilium
+  # does the opposite: an ipBlock does not match pods or, unless
+  # policy-cidr-match-mode includes nodes, other nodes — there a NodePort from
+  # another node is refused whatever this says. Use the ALB's subnets when
+  # they are not the pods' (the same narrowing trustedProxyCidrs needs), the
+  # node subnet when pods have addresses of their own.
+  platformSourceCidrs: []
+
+# Runner images, per family. A family with no image is not offered rather than
+# failing at deploy time with an ImagePullBackOff discovered minutes later.
+runnerImages:
+  python: ""
+  node: ""
+  go: ""
+  # Shiny, plumber, R Markdown and Quarto's knitr engine. One image, because
+  # they are one language family — the split between an R application and an R
+  # document is a framework decision made at detection, never a second runtime.
+  r: ""
+  # Static sites. Not a language family — an empty base holding the runner
+  # binary, under 10 MB — but a family here, because mapping it to node would
+  # tell an operator to provision a Node runtime in order to serve an HTML file
+  # containing no JavaScript.
+  static: ""
+
+# -- What the runner images carry ---------------------------------------------
+#
+# The language version inside each image above, so that an app pinning a range
+# in its `toft.toml` `[runtime]` table can be judged against the image it
+# will actually run in. The build always happens on the platform host, in both
+# execution modes, so the decision is made before any pod exists and has to read
+# a declaration rather than inspect an image.
+#
+# Declared, then verified: the runner probes its own filesystem at start and
+# refuses to run a workload this got wrong, naming both versions. Leave a value
+# empty and nothing is claimed — a pin is then checked against the platform
+# host, which the build log says in those words.
+#
+# Node matches on its major version, Python and R on major.minor, so "24",
+# "3.15" and "4.6" are the shapes wanted here. There is no Go entry: `go build`
+# produces a binary and the workload execs that, so Go's version matters on the
+# build host and is absent from the runner.
+#
+# **Each may name several, comma-separated, highest first** — `"4.6,4.5,4.4"` —
+# because one image may carry more than one interpreter. The first entry is the
+# image's default: the one on its PATH, which an app with no pin gets. Entries
+# are matched on the series, so "4.5" and "4.5.1" are one answer; a malformed
+# entry voids the whole value and the platform refuses to start rather than run
+# against a set you did not write.
+#
+# The runner requires *every* series named to be present in the image, not just
+# the first — an image carrying the default and none of the others is one the
+# platform will resolve an app onto and no pod can run.
+#
+# R is here for the reason Go is not, inverted. An renv library holds compiled
+# objects built against one R and one C library, and the interpreter ships into
+# the running workload — so R's version is a property of the image, and an
+# unset value means an R pin is judged against the platform host instead. R is
+# also why these are lists: a binary package repository publishes a package
+# version only for the R series it was current in, so a project pinned to an
+# older R that resolves to a newer one is served *source* and compiles against
+# headers it predates.
+#
+# **What the runner images built from docker/runner/ carry** (none is
+# published; `docker buildx bake -f docker/runner/bake.hcl` builds them):
+#
+#   runnerVersions:
+#     python: "3.15,3.14,3.13"
+#     node: "26,24,22"
+#     r: "4.6,4.5,4.4"
+#
+# Set those and a pin is judged against the image the app actually runs in;
+# leave them empty and it is judged against the platform host, which the build
+# log says on every deploy. The older entries are carried for apps that pin
+# one by name — a native module is compiled against one major's ABI — so they
+# are never what an unpinned app gets. Drop an entry to stop offering it.
+runnerVersions:
+  python: ""
+  node: ""
+  r: ""
+
+# -- Shared-mode app accounts -------------------------------------------------
+#
+# Which OS identity a shared-mode app's processes run as. Shared apps are
+# processes the shared-mode agent places inside the platform pod, so without an account of their own they are
+# the platform: able to read its database credentials and every other app's
+# secrets. `perApp` is the supported production posture and the only one that
+# also keeps one app out of another's files.
+#
+# This is what runs; set either to false to opt out. The platform pod runs as
+# root (see the Deployment's securityContext) precisely so `autoCreate` can
+# create these accounts — the image cannot know future app slugs, and the
+# account namespace is the container's own.
+#
+# **The platform now derives this posture** from its own uid and runtime, so
+# these values no longer *supply* it — they restate it, and they stay for two
+# reasons. A customer reads the chart's values and cannot read the image's; and
+# turning the posture off has to be expressible on the surface a customer
+# installs from, which this is the only one of. Both variables are always
+# emitted, `""` when off, because empty is how the platform is told "off"
+# explicitly: a key the ConfigMap omitted would leave the derivation standing,
+# and a `perApp: false` here would do nothing at all.
+appAccounts:
+  perApp: true
+  autoCreate: true
+  # The accounts' shared PRIMARY group, and it is load-bearing twice over: the
+  # metadata-egress rule matches on it (`iptables -m owner --gid-owner`), and
+  # each app's own directory access is granted through a *supplementary* group
+  # so that this one stays free to match. Never give an app its own primary
+  # group.
+  group: toft-apps
+
+# Deny workloads the cloud metadata endpoint. On EKS this closes the path from a
+# pod to the node role; it is enforced by a NetworkPolicy egress carve-out,
+# which is why the platform pod carries NET_ADMIN.
+blockAwsMetadata: true
+
+# -- Sign-in bootstrap --------------------------------------------------------
+#
+# Providers are database rows an admin manages at runtime; this only seeds the
+# first one so a fresh install is not left with the built-in administrator as
+# the single way in. The client secret belongs in the Secret, never here.
+auth:
+  github:
+    enabled: false
+    clientId: ""
+  oidc:
+    enabled: false
+    providerId: sso
+    displayName: ""
+    issuer: ""
+    clientId: ""
+
+# -- Telemetry ----------------------------------------------------------------
+#
+# Bootstrap only: a saved configuration in the database wins over this, which is
+# the opposite of the sign-in providers' precedence and deliberate.
+telemetry:
+  enabled: false
+  endpoint: ""
+  # Opens a network listener, so it is deployment configuration and never a
+  # setting a browser can change.
+  metricsAddr: ""
+
+# -- Logging ------------------------------------------------------------------
+#
+# One structured stream on stdout — no files, no second stream, no sidecar. Your
+# cluster's log agent is what ships it, and `kind=access` is the field that tells
+# a request line from everything else.
+#
+# JSON by default, unlike the binary, whose `text` default is for a terminal
+# watching a development server. In a pod the reader is always an agent, and a
+# text access line is one nobody can index — which matters because that line is
+# the only record of who *read* something. The audit log in the database records
+# what people changed; it cannot answer the other question.
+#
+# Nothing here forwards anything. If this install has to be able to say who read
+# what six months ago, that is a retention policy on your aggregator, not a
+# setting in this chart.
+logging:
+  # json or text.
+  format: json
+  # debug, info, warn, error. warn silences ordinary requests and keeps 5xx,
+  # which are logged at error — the knob for an install that finds one line per
+  # request too much and does not want to lose the failures.
+  level: info
+
+# -- Pod ----------------------------------------------------------------------
+serviceAccount:
+  create: true
+  name: ""
+  # IRSA wants eks.amazonaws.com/role-arn here. Pod Identity wants nothing —
+  # the association is made outside the cluster, which is why it survives a
+  # cluster being recreated and IRSA does not.
+  annotations: {}
+  labels: {}
+
+  # Azure workload identity, which needs **an annotation and a label**, on the
+  # ServiceAccount and on the pod template. Set the client id here and the chart
+  # stamps all three: half-setting it is the failure this one value exists to
+  # prevent — the pod gets no projected token and the first Blob or Key Vault
+  # call comes back 401, which reads as a permissions problem in Azure rather
+  # than a missing label in Kubernetes.
+  #
+  # This adds to the pod's labels; it never replaces them. The
+  # `app.kubernetes.io/name: toft` label is compiled into the binary —
+  # every isolated workload's NetworkPolicy admits ingress from it — and nothing
+  # here may touch it. A pod carrying two projected service-account tokens with
+  # two audiences is ordinary Kubernetes: the `toft-bootstrap` audience the
+  # workload contract uses is unchanged.
+  #
+  # The federated credential itself is made outside the cluster, against the
+  # cluster's OIDC issuer — see docs/deploy-aks.md.
+  azureWorkloadIdentity:
+    clientId: ""
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 512Mi
+  limits:
+    # Shared-mode apps run *inside* this pod, so this ceiling covers the
+    # platform and every shared app together. Raise it before hosting anything
+    # real in shared mode.
+    memory: 2Gi
+
+# One replica, Recreate, holding a ReadWriteOnce claim. A rolling update would
+# deadlock on the claim and double-run the build queue besides; the platform
+# drains rather than closing, so a Recreate is a pause and not an outage.
+#
+# Consequently there is no PodDisruptionBudget: with one replica, any PDB that
+# would protect it also blocks node drain forever — which on a spot nodegroup
+# means a node that cannot be reclaimed cleanly.
+replicaCount: 1
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+
+# Arbitrary additional environment. Anything handed to a child process must also
+# be listed in runtime.BaseEnv() to reach one — this map reaches the platform.
+extraEnv: {}

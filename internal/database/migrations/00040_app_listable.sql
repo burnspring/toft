@@ -1,0 +1,54 @@
+-- +goose Up
+--
+-- The owner's half of the install-wide `list` rung.
+--
+-- §90 shipped the rung as one switch: `apps_listable_to_authenticated` says
+-- whether *anything* is listed to everybody who can sign in. That is the right
+-- shape for the install's answer and it is the whole of the answer, which is
+-- the problem. An owner with one app nobody outside their team should have
+-- heard of has no way to withdraw it, so the only control is an administrator
+-- taking the whole estate back -- and an estate-wide switch that one app can
+-- force off is a switch that ends up off.
+--
+-- **A column rather than a deny row.** The obvious implementation of "unless
+-- the owner removes it" is a grant at some negative rung, and there is no such
+-- thing here on purpose: the ladder's whole property is that each rung contains
+-- the one below it, so a deny is a second axis on it, it lands on the
+-- authorizer's hottest path, and it makes `viewer + denied` expressible and
+-- meaningless. This is a property of the app, read once per query as part of
+-- the row the authorizer already loads, and it cannot combine with a grant to
+-- produce a state nobody meant.
+--
+-- **It only ever subtracts, and only from what the install gave.** In the SQL
+-- it is ANDed onto the install-wide disjunct alone -- never onto ownership,
+-- visibility, or either grant clause -- so `listable ⊇ readable` survives and a
+-- grant always outranks it. An owner who un-lists an app takes away what the
+-- install gave and nothing they gave themselves.
+--
+-- **Inert above `private`.** A `public` or `authenticated` app is already
+-- listable to everyone who could open it, so the column changes nothing there.
+-- It is still stored at every visibility: an owner who un-lists a private app,
+-- publishes it, and later makes it private again gets their own answer back,
+-- which a column that cleared itself on the way past would not give them.
+--
+-- DEFAULT true and NOT NULL, so this is a no-op for every existing row and
+-- needs no backfill. Nothing to re-check, so no NOT VALID -- that modifier
+-- belongs to the check constraints 00035, 00038 and 00039 added, and there is
+-- no constraint here.
+ALTER TABLE apps ADD COLUMN listable boolean NOT NULL DEFAULT true;
+
+COMMENT ON COLUMN apps.listable IS 'Whether this app appears in the listing of somebody who holds nothing on it, while the install-wide list rung is on. Inert for public and authenticated apps, which are already listable to everyone who can open them. It subtracts from the install-wide rung and from nothing else, so a grant always outranks it. The owner writes it; the platform never does.';
+
+-- +goose Down
+--
+-- The column goes, and nothing is stranded by it: down from here is a build
+-- with no per-app control, where the column would have no reader and the
+-- install-wide switch would be the whole answer again -- which is exactly what
+-- §90 shipped.
+--
+-- What is lost is the set of apps an owner had withdrawn, and there is nowhere
+-- to keep it: the rung's other half is a settings row, not a table with room
+-- for a column's history. Going back up re-creates every app as listable, which
+-- is the same disclosure the default makes on any upgrade and is stated as such
+-- rather than softened.
+ALTER TABLE apps DROP COLUMN listable;

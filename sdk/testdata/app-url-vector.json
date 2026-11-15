@@ -1,0 +1,21 @@
+{
+  "_comment": "toft.app.url(path): an app path joined onto the address GET /api/v1/app/url answers. Read by all four SDKs, so an app's links are the same in every language. A path is the app's (a leading / is the app's root, never the host's); one already carrying the base path is not prefixed twice, which is what makes url(run.status_url) and url(url_for(...)) right; a query or fragment is kept; an absolute URL is refused with bad_request. `want` is the URL, `error` the code.",
+  "cases": [
+    {"name": "front page", "public_url": "https://apps.example.com/apps/reporter", "base_path": "/apps/reporter", "path": "", "want": "https://apps.example.com/apps/reporter/"},
+    {"name": "app root path", "public_url": "https://apps.example.com/apps/reporter", "base_path": "/apps/reporter", "path": "/reports/42", "want": "https://apps.example.com/apps/reporter/reports/42"},
+    {"name": "no leading slash", "public_url": "https://apps.example.com/apps/reporter", "base_path": "/apps/reporter", "path": "reports/42", "want": "https://apps.example.com/apps/reporter/reports/42"},
+    {"name": "already prefixed", "public_url": "https://apps.example.com/apps/reporter", "base_path": "/apps/reporter", "path": "/apps/reporter/reports/42", "want": "https://apps.example.com/apps/reporter/reports/42"},
+    {"name": "a run's status_url", "public_url": "https://apps.example.com/apps/reporter", "base_path": "/apps/reporter", "path": "/apps/reporter/__toft/runs/r1", "want": "https://apps.example.com/apps/reporter/__toft/runs/r1"},
+    {"name": "the base path alone", "public_url": "https://apps.example.com/apps/reporter", "base_path": "/apps/reporter", "path": "/apps/reporter", "want": "https://apps.example.com/apps/reporter/"},
+    {"name": "the base path with a query", "public_url": "https://apps.example.com/apps/reporter", "base_path": "/apps/reporter", "path": "/apps/reporter?week=12", "want": "https://apps.example.com/apps/reporter/?week=12"},
+    {"name": "a lookalike prefix is a path", "public_url": "https://apps.example.com/apps/reporter", "base_path": "/apps/reporter", "path": "/apps/reporterx/a", "want": "https://apps.example.com/apps/reporter/apps/reporterx/a"},
+    {"name": "query only", "public_url": "https://apps.example.com/apps/reporter", "base_path": "/apps/reporter", "path": "?tab=2", "want": "https://apps.example.com/apps/reporter/?tab=2"},
+    {"name": "query and fragment kept", "public_url": "https://apps.example.com/apps/reporter", "base_path": "/apps/reporter", "path": "/r?id=4&x=a%20b#top", "want": "https://apps.example.com/apps/reporter/r?id=4&x=a%20b#top"},
+    {"name": "own hostname, front page", "public_url": "https://recon.example.org", "base_path": "", "path": "", "want": "https://recon.example.org/"},
+    {"name": "own hostname, path", "public_url": "https://recon.example.org", "base_path": "", "path": "/a/b", "want": "https://recon.example.org/a/b"},
+    {"name": "own hostname, status_url", "public_url": "https://recon.example.org", "base_path": "", "path": "/__toft/runs/r1", "want": "https://recon.example.org/__toft/runs/r1"},
+    {"name": "an absolute URL", "public_url": "https://apps.example.com/apps/reporter", "base_path": "/apps/reporter", "path": "https://elsewhere.example/x", "error": "bad_request"},
+    {"name": "a scheme-relative URL", "public_url": "https://apps.example.com/apps/reporter", "base_path": "/apps/reporter", "path": "//elsewhere.example/x", "error": "bad_request"},
+    {"name": "a mailto", "public_url": "https://apps.example.com/apps/reporter", "base_path": "/apps/reporter", "path": "mailto:a@example.com", "error": "bad_request"}
+  ]
+}

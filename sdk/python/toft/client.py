@@ -1,0 +1,332 @@
+"""A running job's view of itself, over the runner callback contract.
+
+This is the *inside* of a job — code executing as the workload, reporting back
+over ``/api/v1/runner/*`` with the run-scoped token the runner exported. It is
+the other side of :mod:`toft.jobs`, which is how an app *starts* one::
+
+    r = toft.run                              # None outside a job
+    region = r.params["region"]               # typed by toml: ints are ints
+    r.progress(40, "reading ledgers")         # the status page shows both
+    r.log("12,044 rows")                      # stdout; the runner ships it
+    r.write_output_json({"rows": 12044})      # presigned PUT, both modes
+
+**Params are the only input.** There is no payload: anything bigger than a
+param belongs in the app's own storage, and the param names where.
+``write_output`` is the one durable result channel, and it outlives scratch —
+``TOFT_SCRATCH_DIR`` is wiped on every start, so a report written there is a
+dead path tomorrow while the run row cheerfully still says ``succeeded``.
+
+:attr:`Run.deadline` is when the platform stops this run. A job with a long
+loop checks it and stops cleanly, rather than being stopped mid-write.
+
+Standard library only, on purpose. This runs inside a customer's app image
+beside their own dependency tree, and a version conflict between the SDK's
+HTTP library and theirs would be our bug appearing in their build.
+"""
+
+from __future__ import annotations
+
+import datetime
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+import weakref
+from typing import Any, Optional
+
+# Re-exported so `from toft.client import ToftError` keeps working.
+# The definition moved to toft.errors when the app surface arrived, because
+# everything in the package needs the error and nothing else should need the
+# jobs client to get it.
+from .caller import ROLE_UNKNOWN
+from .errors import ToftError, bad_request, refused, store_refused
+from .jobs import _parse_time
+from .transport import _from_http_error_or_redirect, _open_without_redirects
+
+DEFAULT_TIMEOUT = 30.0
+
+#: The runner callback contract this SDK speaks, and it must equal the platform's
+#: ``runner.ContractVersion``. A partial upgrade is reported rather than
+#: tolerated, so a stale number here is not a warning — it is a 409 on every
+#: ``progress`` call a job makes. ``sdk/contract_test.go``
+#: is what keeps the four copies of it in step.
+RUNNER_CONTRACT_VERSION = "2"
+
+
+def _sealed(value: str) -> Any:
+    """``value`` behind a call, so ``repr``/``vars`` show a function, not it."""
+    def reveal() -> str:
+        return value
+    return reveal
+
+
+class _RunnerTransport:
+    """Calls to ``/api/v1/runner/*`` with the run-scoped token.
+
+    Deliberately not the app transport in :mod:`toft.transport`. That one
+    carries the app token to ``/api/v1/app/*``; this one carries a credential
+    minted for one run, valid only until that run's deadline, and accepted only
+    on the callback routes. The audiences are what keep a job's progress bar from
+    being able to act as the app — sharing one client between them would be the
+    first step towards sharing a credential.
+    """
+
+    def __init__(self, base_url: str, token: str, timeout: float = DEFAULT_TIMEOUT) -> None:
+        self._base = base_url.rstrip("/")
+        # A closure, not the string: a transport reached through a debugger's
+        # vars() must not print the run's credential either.
+        self._token = _sealed(token)
+        self._timeout = timeout
+
+    def __repr__(self) -> str:
+        return f"_RunnerTransport({self._base!r})"
+
+    def __reduce_ex__(self, protocol: Any) -> Any:
+        raise refused("bad_request", "the runner transport holds the run's credential and cannot be pickled",
+                      "pass run.id, or the plain values you need, to the other process instead")
+
+    def request(self, method: str, path: str, body: Any = None) -> Any:
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(f"{self._base}{path}", data=data, method=method)
+        req.add_header("Authorization", f"Bearer {self._token()}")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("X-Toft-Runner-Version", RUNNER_CONTRACT_VERSION)
+
+        try:
+            # Redirects refused, as on the app transport: the run token must
+            # not follow a Location to another host.
+            with _open_without_redirects(req, self._timeout) as resp:
+                payload = resp.read()
+                return json.loads(payload) if payload else None
+        except urllib.error.HTTPError as exc:
+            # The transport's own reading of a refusal, so a job's run calls
+            # carry the envelope — code, retryable, hint — as the app's do.
+            raise _from_http_error_or_redirect(exc, path) from None
+        except urllib.error.URLError as exc:
+            raise ToftError(f"cannot reach Toft at {self._base}: {exc.reason}") from None
+
+
+class _RunSecrets:
+    """A run's token and output URL — held here, never on the Run itself."""
+
+    __slots__ = ("token", "output_uri")
+
+    def __init__(self, token: str, output_uri: str) -> None:
+        self.token = token
+        self.output_uri = output_uri
+
+    def __repr__(self) -> str:
+        return "_RunSecrets(<redacted>)"
+
+    def __reduce_ex__(self, protocol: Any) -> Any:
+        raise refused("bad_request", "a run's credentials cannot be pickled",
+                      "pass run.id, or the plain values you need, to the other process instead")
+
+
+_SECRETS: "weakref.WeakKeyDictionary[Run, _RunSecrets]" = weakref.WeakKeyDictionary()
+
+
+# Module-level, not methods: anything on the class is reachable through
+# dir(toft.run), and run._output_uri() handed back the presigned URL — and
+# run._transport()._token() the job token — to any code that walked it (BB-013).
+def _run_transport(run: "Run") -> "_RunnerTransport":
+    return _RunnerTransport(run._base_url, _SECRETS[run].token)
+
+
+def _run_output_uri(run: "Run") -> str:
+    return _SECRETS[run].output_uri
+
+
+# The route a run mints its output URL at, at the moment it writes. The URL
+# in TOFT_OUTPUT_URI was signed at bootstrap for at most six hours — less
+# where the store signs with a role's temporary credential — so a long run's
+# write at its end found it expired. Asked first; TOFT_OUTPUT_URI is the
+# fallback for a platform that predates the route.
+_OUTPUT_URL_PATH = "/api/v1/runner/output-url"
+
+# Azure Blob's Put Blob refuses a request without it; S3 ignores it. Sent on
+# every output PUT, so the URL alone decides nothing about the backend.
+_OUTPUT_HEADERS = {"x-ms-blob-type": "BlockBlob"}
+
+
+def _fresh_output_url(run: "Run") -> str:
+    """A just-minted output URL, or "" when the platform did not give one."""
+    if not run._base_url or not _SECRETS[run].token:
+        return ""
+    try:
+        resp = _run_transport(run).request("POST", _OUTPUT_URL_PATH, {"version": RUNNER_CONTRACT_VERSION})
+    except Exception:  # noqa: BLE001 — any failure falls back to TOFT_OUTPUT_URI
+        return ""
+    url = resp.get("url") if isinstance(resp, dict) else None
+    return url if isinstance(url, str) and url.startswith(("https://", "http://")) else ""
+
+
+class Run:
+    """The job's own view of itself: who started it, its params, its deadline;
+    report progress, log, write output.
+
+    ``Run.from_env()`` inside a job configures itself from what the runner
+    already exported, so a job never handles a credential explicitly.
+    """
+
+    def __init__(self, base_url: str, token: str, run_id: str, output_uri: Optional[str] = None) -> None:
+        # The run token and the presigned output URL are kept off the instance:
+        # vars(run), dir(run)'s values and a debugger's locals pane read
+        # __dict__, and the URL carries X-Amz-Credential and a session token.
+        # They live in a module-level table keyed weakly by this object.
+        _SECRETS[self] = _RunSecrets(
+            token, os.environ.get("TOFT_OUTPUT_URI", "") if output_uri is None else output_uri)
+        self._base_url = base_url
+        self.id = run_id
+        #: The job this run is of — its ``[jobs.<name>]`` in ``toft.toml``.
+        self.job = os.environ.get("TOFT_JOB_NAME", "")
+        #: The run this one re-ran, or ``None``. A rerun carries the same
+        #: params; a job that must not repeat a side effect checks this.
+        self.rerun_of = os.environ.get("TOFT_RERUN_OF") or None
+        #: *How* this run started: ``app``, ``viewer``, ``cli``, ``schedule`` or
+        #: ``ui`` — the run's ``started_by``.
+        self.trigger = os.environ.get("TOFT_TRIGGER", "")
+        #: *Who* started it: one of the ROLE_* words, ``"system"`` for a
+        #: schedule firing on its schedule, ``"app"`` for the app starting work
+        #: for itself, and ``"unknown"`` where the platform did not say.
+        #:
+        #: The pair is the point. "ui" tells a report job nothing about
+        #: whether to include the private columns; "ui" plus "viewer" does.
+        #:
+        #: **The role is today's, not the day the run was queued.** It is
+        #: derived from the run's actor when the workload starts, so somebody
+        #: demoted in between reports their current role — the right answer for
+        #: a job deciding what work to do, and the wrong one for an audit. The
+        #: audit question is answered by the run's actor in Toft's own
+        #: history, which does not move.
+        self.trigger_role = os.environ.get("TOFT_TRIGGER_ROLE") or ROLE_UNKNOWN
+
+    def __repr__(self) -> str:
+        # Never the job token or the presigned output URL: a run printed into
+        # a job's log is read by anyone who can read the app's runs.
+        return f"Run(id={self.id!r}, job={self.job!r}, trigger={self.trigger}/{self.trigger_role})"
+
+    def __reduce_ex__(self, protocol: Any) -> Any:
+        # Pickling would write the run token into the bytes — a multiprocessing
+        # queue, a cache, a task broker. Refused rather than silently dropped:
+        # a run unpickled without its token would fail later, somewhere else.
+        raise refused(
+            "bad_request",
+            "a job's run cannot be pickled: it holds the run's own credential",
+            hint="pass run.id and run.params instead; any process of the job "
+                 "can read toft.run itself, from the environment the runner set")
+
+    def __reduce__(self) -> Any:
+        return self.__reduce_ex__(2)
+
+    def __copy__(self) -> "Run":
+        return self
+
+    def __deepcopy__(self, memo: Any) -> "Run":
+        return self
+
+    @classmethod
+    def from_env(cls) -> "Run":
+        base_url = os.environ.get("TOFT_API_URL")
+        token = os.environ.get("TOFT_JOB_TOKEN")
+        run_id = os.environ.get("TOFT_RUN_ID")
+        if not (base_url and token and run_id):
+            raise ToftError(
+                "not running inside a Toft job — TOFT_API_URL, "
+                "TOFT_JOB_TOKEN and TOFT_RUN_ID are set by the runner",
+                body={"code": "off_platform", "retryable": False,
+                      "hint": "use toft.run, which is None outside a job, rather than Run.from_env()"},
+            )
+        return cls(base_url, token, run_id)
+
+    @property
+    def started_by(self) -> str:
+        """The contract's name for :attr:`trigger`."""
+        return self.trigger
+
+    @property
+    def params(self) -> dict:
+        """The run's params, typed as ``toft.toml`` declares them."""
+        raw = os.environ.get("TOFT_PARAMS")
+        return json.loads(raw) if raw else {}
+
+    @property
+    def scheduled_for(self) -> Optional[datetime.datetime]:
+        """The instant this run is for, or ``None`` when nobody gave one.
+
+        A scheduled run's is the tick it fired for — the 03:00 run is the 03:00
+        run even if it started at 03:40 — in the schedule's own zone. A run
+        somebody started with ``toft job run --for`` carries what they named. It is
+        **never defaulted to now**: a re-run of Tuesday's work on Thursday must
+        not quietly process Thursday.
+        """
+        return _parse_time(os.environ.get("TOFT_SCHEDULED_FOR"))
+
+    @property
+    def deadline(self) -> Optional[datetime.datetime]:
+        """When the platform stops this run, or ``None`` where it did not say."""
+        return _parse_time(os.environ.get("TOFT_DEADLINE"))
+
+    def progress(self, percent: int, message: Optional[str] = None) -> None:
+        """Report how far along this run is, 0–100, and optionally what it is
+        doing — a few words the status page shows under the bar.
+
+        ``percent`` outside 0–100 is refused with ``bad_request`` before any
+        request, rather than drawn as a bar past its end."""
+        if isinstance(percent, bool) or not isinstance(percent, (int, float)) or not 0 <= percent <= 100:
+            raise bad_request(f"progress is a percentage from 0 to 100, got {percent!r}",
+                              hint="pass a number from 0 to 100, e.g. run.progress(40, \"loading rows\")")
+        body: dict[str, Any] = {"version": RUNNER_CONTRACT_VERSION, "percent": int(percent)}
+        if message:
+            body["message"] = str(message)
+        _run_transport(self).request("POST", "/api/v1/runner/progress", body)
+
+    def log(self, message: str, error: bool = False) -> None:
+        """Write one line to this run's log.
+
+        Nothing but a print — the runner ships stdout and stderr — and here so a
+        job does not have to know that, or that a buffered stdout loses the last
+        lines of a run that is then killed.
+        """
+        print(message, file=sys.stderr if error else sys.stdout, flush=True)
+
+    def write_output(self, data: bytes | str) -> None:
+        """Upload this run's output.
+
+        The URL is minted at the moment of the write, so a run of any length
+        can write at its end; ``TOFT_OUTPUT_URI`` is the fallback. Also a
+        presigned URL, and also in both execution modes — a filesystem
+        path would work in shared mode and would then make an app written
+        against it unable to move to isolated mode.
+        """
+        output_uri = _run_output_uri(self)
+        if not output_uri:
+            raise ToftError("this run has no output location",
+                            body={"code": "no_output", "retryable": False,
+                                  "hint": "write_output works inside a job run, which the platform gives an output location; outside one there is nowhere to write"})
+        if not isinstance(data, (str, bytes, bytearray, memoryview)):
+            raise bad_request(
+                f"write_output takes bytes or text, got {type(data).__name__}",
+                hint="use write_output_json(value) for anything else")
+        body = data.encode() if isinstance(data, str) else bytes(data)
+        output_uri = _fresh_output_url(self) or output_uri
+        req = urllib.request.Request(output_uri, data=body, method="PUT", headers=dict(_OUTPUT_HEADERS))
+        try:
+            with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT):
+                return
+        except urllib.error.HTTPError as exc:
+            raise store_refused("output_unwritable", f"uploading output: {exc.code} {exc.reason}",
+                                exc.code) from None
+        except urllib.error.URLError as exc:
+            # A transport failure — the one kind of statusless error that is
+            # rightly retryable.
+            raise ToftError(f"uploading output: {exc.reason}") from None
+
+    def write_output_json(self, value: Any) -> None:
+        try:
+            text = json.dumps(value, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise bad_request(f"the output is not JSON-serializable: {exc}",
+                              hint="convert it to dicts, lists, strings, numbers and booleans first, or write bytes with write_output") from None
+        self.write_output(text)

@@ -1,0 +1,77 @@
+{{- if and (include "toft.isolatedEnabled" .) (.Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy") }}
+{{- $drivers := list "s3.csi.aws.com" "blob.csi.azure.com" }}
+{{- with (.Values.extraEnv | default dict).KUBE_STORE_CSI_DRIVER }}{{- $drivers = append $drivers . | uniq }}{{- end }}
+{{/*
+The fence on the platform's PersistentVolume grant (ADR §12a).
+
+PersistentVolumes are cluster-scoped, so the platform's create, patch and delete
+reach every volume in the cluster, and RBAC has no way to say "only the ones
+claimed from my namespace". Patch is what a resource delete uses to flip its own
+volumes to Delete; unfenced, patch plus delete is the ability to destroy any
+volume's data. This policy is that missing scope, enforced by the API server
+rather than by the platform's own good behaviour:
+
+  - every write by the platform's ServiceAccount to a PV must touch one claimed
+    from the apps namespace, before and after;
+  - and a PV the platform *creates* must be what Toft creates: a CSI volume on
+    one of the object-store drivers (Mountpoint for S3, Azure Blob, or the
+    operator's KUBE_STORE_CSI_DRIVER under extraEnv) carrying no secret
+    reference. An allow-list, not a deny-list: Pod Security `restricted` limits
+    a pod's volume *types*, and a persistentVolumeClaim is allowed whatever PV
+    is behind it, so a hostPath or local PV claimed from the apps namespace
+    would hand a restricted pod the node's filesystem. It also refuses a
+    hand-made EFS PV naming another file system's access point — the shape of
+    AWS security bulletin 2026-099 — since EFS volumes are provisioned by the
+    driver, never by Toft. CREATE only: the source is immutable, `object` is
+    null on DELETE, and the flip patches EFS volumes the driver provisioned.
+
+Rendered only where the API exists (Kubernetes 1.30+), and the patch grant in
+rbac.yaml is rendered under the same condition: no patch without its fence.
+*/}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "toft.fullname" . }}-volumes
+  labels:
+    {{- include "toft.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["persistentvolumes"]
+  matchConditions:
+    - name: the-platform-only
+      expression: >-
+        request.userInfo.username ==
+        'system:serviceaccount:{{ .Release.Namespace }}:{{ include "toft.serviceAccountName" . }}'
+  validations:
+    - expression: >-
+        request.operation == 'CREATE' ||
+        (has(oldObject.spec.claimRef) && oldObject.spec.claimRef.namespace == '{{ .Values.kube.appsNamespace }}')
+      message: "the platform may change or delete only volumes claimed from {{ .Values.kube.appsNamespace }}"
+    - expression: >-
+        request.operation == 'DELETE' ||
+        (has(object.spec.claimRef) && object.spec.claimRef.namespace == '{{ .Values.kube.appsNamespace }}')
+      message: "a volume the platform writes must stay claimed from {{ .Values.kube.appsNamespace }}"
+    - expression: >-
+        request.operation != 'CREATE' ||
+        (has(object.spec.csi) &&
+        object.spec.csi.driver in [{{ range $i, $d := $drivers }}{{ if $i }}, {{ end }}'{{ $d }}'{{ end }}] &&
+        !has(object.spec.csi.nodePublishSecretRef) && !has(object.spec.csi.nodeStageSecretRef) &&
+        !has(object.spec.csi.controllerPublishSecretRef) && !has(object.spec.csi.controllerExpandSecretRef) &&
+        !has(object.spec.csi.nodeExpandSecretRef))
+      message: "the platform creates only object-store CSI volumes ({{ join ", " $drivers }}) with no secret reference"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "toft.fullname" . }}-volumes
+  labels:
+    {{- include "toft.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "toft.fullname" . }}-volumes
+  validationActions: [Deny]
+{{- end }}

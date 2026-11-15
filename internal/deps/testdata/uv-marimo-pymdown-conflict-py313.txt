@@ -1,0 +1,110 @@
+error: No solution found when resolving dependencies
+  cause: Because all of:
+             marimo>=0.1.0,<=0.1.81
+             marimo>=0.1.84,<=0.7.6
+             marimo>=0.7.8,<=0.9.23
+             marimo>=0.9.25,<=0.10.0
+         depend on pymdown-extensions>=9.0,<11 and all of:
+             marimo>=0.1.0,<=0.1.81
+             marimo>=0.1.84,<=0.7.6
+             marimo>=0.7.8,<=0.9.23
+             marimo>=0.9.25,<=0.10.10
+             marimo>=0.10.12,<=0.13.11
+             marimo>=0.13.13
+         depend on pymdown-extensions>=12.3, we can conclude that all of:
+             marimo>=0.1.0,<=0.1.81
+             marimo>=0.1.84,<=0.7.6
+             marimo>=0.7.8,<=0.9.23
+             marimo>=0.9.25,<=0.10.0
+          cannot be used.
+         And because all of:
+             marimo<=0.0.0
+             marimo>=0.1.82,<=0.1.83
+             marimo==0.7.7
+             marimo==0.9.24
+          have no usable wheels, we can conclude that all of:
+             marimo<=0.0.0
+             marimo>=0.1.82,<=0.1.83
+             marimo==0.7.7
+             marimo==0.9.24
+          cannot be used. (1)
+
+         Because all of:
+             marimo>=0.10.1,<=0.10.10
+             marimo>=0.10.12,<=0.10.19
+         depend on pymdown-extensions>=10,<11 and all of:
+             marimo>=0.10.1,<=0.10.10
+             marimo>=0.10.12,<=0.13.11
+             marimo>=0.13.13
+         depend on pymdown-extensions>=12.3, we can conclude that all of:
+             marimo>=0.10.1,<=0.10.10
+             marimo>=0.10.12,<=0.10.19
+          cannot be used.
+         And because we know from (1) that all of:
+             marimo<=0.0.0
+             marimo>=0.1.82,<=0.1.83
+             marimo==0.7.7
+             marimo==0.9.24
+          cannot be used, we can conclude that all of:
+             marimo<=0.10.10
+             marimo>=0.10.12,<=0.10.19
+          cannot be used.
+         And because only the following versions of marimo are available:
+             marimo<=0.10.10
+             marimo==0.10.11
+             marimo>=0.10.12
+         we can conclude that all of:
+             marimo<0.10.11
+             marimo>0.10.11,<=0.10.19
+          cannot be used.
+         And because marimo==0.10.11 has no usable wheels and only the following versions of marimo are available:
+             marimo<=0.10.19
+             marimo>=0.11.0
+         we can conclude that marimo<0.11.0 cannot be used. (2)
+
+         Because all of:
+             marimo>=0.11.0,<=0.13.11
+             marimo>=0.13.13,<=0.15.2
+         depend on pymdown-extensions>=10.11.2,<11 and all of:
+             marimo>=0.11.0,<=0.13.11
+             marimo>=0.13.13
+         depend on pymdown-extensions>=12.3, we can conclude that all of:
+             marimo>=0.11.0,<=0.13.11
+             marimo>=0.13.13,<=0.15.2
+          cannot be used.
+         And because we know from (2) that marimo<0.11.0 cannot be used, we can conclude that all of:
+             marimo<=0.13.11
+             marimo>=0.13.13,<=0.15.2
+          cannot be used.
+         And because only the following versions of marimo are available:
+             marimo<=0.13.11
+             marimo==0.13.12
+             marimo>=0.13.13
+         we can conclude that all of:
+             marimo<0.13.12
+             marimo>0.13.12,<=0.15.2
+          cannot be used.
+         And because marimo==0.13.12 has no usable wheels and only the following versions of marimo are available:
+             marimo<=0.15.2
+             marimo>=0.15.3
+         we can conclude that marimo<0.15.3 cannot be used. (3)
+
+         Because marimo>=0.15.3,<=0.23.2 depends on pymdown-extensions>=10.15,<11 and marimo>=0.15.3 depends on pymdown-extensions>=12.3, we can conclude that marimo>=0.15.3,<=0.23.2 cannot be used.
+         And because we know from (3) that marimo<0.15.3 cannot be used, we can conclude that marimo<=0.23.2 cannot be used.
+         And because only the following versions of marimo are available:
+             marimo<=0.23.2
+             marimo>=0.23.3
+         we can conclude that marimo<0.23.3 cannot be used. (4)
+
+         Because marimo>=0.23.3,<=0.23.15 depends on pymdown-extensions>=10.21.2,<11 and marimo>=0.23.3 depends on pymdown-extensions>=12.3, we can conclude that marimo>=0.23.3,<=0.23.15 cannot be used.
+         And because we know from (4) that marimo<0.23.3 cannot be used, we can conclude that marimo<=0.23.15 cannot be used.
+         And because only the following versions of marimo are available:
+             marimo<=0.23.15
+             marimo>=0.23.16
+         we can conclude that marimo<0.23.16 cannot be used. (5)
+
+         Because marimo>=0.23.16 depends on pymdown-extensions>=10.21.2,<12 and pymdown-extensions>=12.3, we can conclude that marimo>=0.23.16 cannot be used.
+         And because we know from (5) that marimo<0.23.16 cannot be used, we can conclude that all versions of marimo cannot be used.
+         And because you require marimo, we can conclude that your requirements are unsatisfiable.
+
+hint: Wheels are required for `marimo` because building from source is disabled for all packages (i.e., with `--no-build`)

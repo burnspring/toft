@@ -1,0 +1,218 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/geist-mono";
+
+/*
+ * Light theme only, made true.
+ *
+ * Tailwind v4's default `dark:` variant is `@media (prefers-color-scheme:
+ * dark)`, and twenty-one lines of the vendored shadcn set in
+ * `components/ui/` still carry `dark:` utilities. With no declaration here,
+ * every one of them fired for a viewer whose *operating system* was in dark
+ * mode — on a product with no dark theme, no toggle and no `.dark` palette. The
+ * visible one was `dark:data-unchecked:bg-foreground` on the Switch thumb: every
+ * OFF switch in the product rendered near-black for those readers.
+ *
+ * Redefining the variant against a class nothing ever sets makes all twenty-one
+ * inert without editing the vendored files, so `npx shadcn add` keeps producing
+ * output that drops in unchanged and a diff against upstream stays readable.
+ * `conventions.test.ts` asserts this line is here, because deleting it is
+ * silent and its absence is only visible on somebody else's machine.
+ */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+    --font-sans: 'Geist Variable', sans-serif;
+    /* The product's second voice, and it earns the name: a slug, a commit, an
+     * endpoint, a cron expression, an environment variable, a log line and a
+     * stack frame are all things a person copies, compares character by
+     * character, or types back somewhere else. There are 150 `font-mono` sites
+     * and until now every one of them fell through to whatever the operating
+     * system happened to offer — Menlo here, Consolas there, Courier on the
+     * unlucky ones — none of which share Geist's metrics or x-height, so a
+     * `<code>` inside a sentence sat at the wrong size and the wrong weight.
+     * Geist Mono is the same superfamily, drawn to match. */
+    --font-mono: 'Geist Mono Variable', ui-monospace, monospace;
+
+    /* One step below Tailwind's smallest, and the floor. What it replaces is
+     * `text-[9px]`, `text-[10px]` and `text-[11px]` — fifty-seven arbitrary
+     * sizes with no rule between them, three of which were below the point
+     * where a person can read a badge without leaning in. Nothing in this
+     * product renders type smaller than this. */
+    --text-2xs: 0.6875rem;
+    --text-2xs--line-height: 1rem;
+    --color-sidebar-ring: var(--sidebar-ring);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar: var(--sidebar);
+    --color-chart-5: var(--chart-5);
+    --color-chart-4: var(--chart-4);
+    --color-chart-3: var(--chart-3);
+    --color-chart-2: var(--chart-2);
+    --color-chart-1: var(--chart-1);
+    --color-ring: var(--ring);
+    --color-input: var(--input);
+    --color-border: var(--border);
+    --color-destructive: var(--destructive);
+    /* Tone — the five things this product ever says about a state. Every
+       badge, dot, banner and chip reads these; nothing renders a palette
+       colour of its own. See `lib/tone.ts`. */
+    --color-tone-ok-surface: var(--tone-ok-surface);
+    --color-tone-ok-border: var(--tone-ok-border);
+    --color-tone-ok-fg: var(--tone-ok-fg);
+    --color-tone-ok-solid: var(--tone-ok-solid);
+    --color-tone-attention-surface: var(--tone-attention-surface);
+    --color-tone-attention-border: var(--tone-attention-border);
+    --color-tone-attention-fg: var(--tone-attention-fg);
+    --color-tone-attention-solid: var(--tone-attention-solid);
+    --color-tone-danger-surface: var(--tone-danger-surface);
+    --color-tone-danger-border: var(--tone-danger-border);
+    --color-tone-danger-fg: var(--tone-danger-fg);
+    --color-tone-danger-solid: var(--tone-danger-solid);
+    --color-tone-neutral-surface: var(--tone-neutral-surface);
+    --color-tone-neutral-border: var(--tone-neutral-border);
+    --color-tone-neutral-fg: var(--tone-neutral-fg);
+    --color-tone-neutral-solid: var(--tone-neutral-solid);
+    --color-tone-info-surface: var(--tone-info-surface);
+    --color-tone-info-border: var(--tone-info-border);
+    --color-tone-info-fg: var(--tone-info-fg);
+    --color-tone-info-solid: var(--tone-info-solid);
+    /* The log pane. Not a tone — a terminal is not a state — and not a raw
+       palette step either: `lib/ansi.tsx` tunes its own colours against this
+       exact background, so the two have to be able to move together. */
+    --color-terminal: var(--terminal);
+    --color-terminal-foreground: var(--terminal-foreground);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-accent: var(--accent);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-muted: var(--muted);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-secondary: var(--secondary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-primary: var(--primary);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-popover: var(--popover);
+    --color-card-foreground: var(--card-foreground);
+    --color-card: var(--card);
+    --color-foreground: var(--foreground);
+    --color-background: var(--background);
+    --radius-sm: calc(var(--radius) * 0.6);
+    --radius-md: calc(var(--radius) * 0.8);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) * 1.4);
+    --radius-2xl: calc(var(--radius) * 1.8);
+    --radius-3xl: calc(var(--radius) * 2.2);
+    --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+    --background: oklch(0.98 0.002 250);
+    --foreground: oklch(0.145 0 0);
+    --card: oklch(1 0 0);
+    --card-foreground: oklch(0.145 0 0);
+    --popover: oklch(1 0 0);
+    --popover-foreground: oklch(0.145 0 0);
+    --primary: oklch(0.488 0.180 264);
+    --primary-foreground: oklch(0.985 0 0);
+    --secondary: oklch(0.965 0.005 264);
+    --secondary-foreground: oklch(0.205 0 0);
+    --muted: oklch(0.965 0.005 264);
+    --muted-foreground: oklch(0.50 0 0);
+    --accent: oklch(0.955 0.015 264);
+    --accent-foreground: oklch(0.318 0.10 264);
+    --destructive: oklch(0.577 0.245 27.325);
+    --border: oklch(0.912 0.005 264);
+    --input: oklch(0.912 0.005 264);
+    --ring: oklch(0.488 0.180 264);
+    --chart-1: oklch(0.488 0.180 264);
+    --chart-2: oklch(0.600 0.160 200);
+    --chart-3: oklch(0.550 0.170 150);
+    --chart-4: oklch(0.650 0.120 300);
+    --chart-5: oklch(0.500 0.100 30);
+    --radius: 0.5rem;
+    --sidebar: oklch(1 0 0);
+    --sidebar-foreground: oklch(0.145 0 0);
+    --sidebar-primary: oklch(0.488 0.180 264);
+    --sidebar-primary-foreground: oklch(0.985 0 0);
+    --sidebar-accent: oklch(0.955 0.015 264);
+    --sidebar-accent-foreground: oklch(0.205 0 0);
+    --sidebar-border: oklch(0.912 0.005 264);
+    --sidebar-ring: oklch(0.488 0.180 264);
+
+    /* Tone.
+     *
+     * Five meanings, four slots each: `surface` is the tinted background of a
+     * chip or a banner, `border` its edge, `fg` text that is readable on that
+     * surface *and* on the page, and `solid` the filled form — a dot, a bar, a
+     * chart series.
+     *
+     * These are the values the pages were already using, lifted out of the
+     * palette and named for what they mean. The point of the move is that six
+     * components used to hold their own copy of this table and had already
+     * drifted: a sleeping app was zinc-500 as a dot and zinc-600 as a badge.
+     * There is now one place to disagree with.
+     *
+     * `attention` is not a failure. It is the colour of something a person
+     * should look at — a build running, a key disabled, a store an app may
+     * overwrite — and it must never be reached for to mean "broken".
+     */
+    --tone-ok-surface: oklch(0.979 0.021 166.113);
+    --tone-ok-border: oklch(0.905 0.093 164.15);
+    --tone-ok-fg: oklch(0.508 0.118 165.612);
+    --tone-ok-solid: oklch(0.696 0.17 162.48);
+
+    --tone-attention-surface: oklch(0.987 0.022 95.277);
+    --tone-attention-border: oklch(0.924 0.12 95.746);
+    --tone-attention-fg: oklch(0.555 0.163 48.998);
+    --tone-attention-solid: oklch(0.769 0.188 70.08);
+
+    --tone-danger-surface: oklch(0.971 0.013 17.38);
+    --tone-danger-border: oklch(0.885 0.062 18.334);
+    --tone-danger-fg: oklch(0.505 0.213 27.518);
+    --tone-danger-solid: oklch(0.637 0.237 25.331);
+
+    --tone-neutral-surface: oklch(0.985 0 0);
+    --tone-neutral-border: oklch(0.92 0.004 286.32);
+    --tone-neutral-fg: oklch(0.442 0.017 285.786);
+    --tone-neutral-solid: oklch(0.552 0.016 285.938);
+
+    --tone-info-surface: oklch(0.962 0.018 272.314);
+    --tone-info-border: oklch(0.87 0.065 274.039);
+    --tone-info-fg: oklch(0.457 0.24 277.023);
+    --tone-info-solid: oklch(0.488 0.180 264);
+
+    /* The one dark surface in a light-only product, and it is dark because a
+       terminal is: process output, build logs and ANSI escapes are read
+       against black everywhere else they are ever read. */
+    --terminal: oklch(0.141 0.005 285.823);
+    --terminal-foreground: oklch(0.92 0.004 286.32);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    }
+  body {
+    @apply bg-background text-foreground;
+    }
+  html {
+    @apply font-sans;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

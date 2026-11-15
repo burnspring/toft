@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: A question
+    url: https://github.com/burnspring/toft/discussions
+    about: Ask in Discussions — issues are for bugs and feature requests.
+  - name: A security vulnerability
+    url: https://github.com/burnspring/toft/blob/main/SECURITY.md
+    about: Report it privately by email, never in a public issue.
+  - name: The manuals
+    url: https://docs.gettoft.com
+    about: The user, administrator and CLI & SDK guides.

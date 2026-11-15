@@ -1,0 +1,38 @@
+name: Bug
+description: Something in Toft does not work as the manuals say it should.
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`toft version`, or the version on Admin → System info."
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How Toft is installed
+      options:
+        - Docker Compose (one machine)
+        - Kubernetes (the Helm chart)
+        - Built and run from source
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The build log, the app log or the server's output. Remove anything secret first.
+      render: text

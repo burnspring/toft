@@ -1,0 +1,389 @@
+# The one place this package talks to the platform.
+#
+# Every call carries the app token and the contract version, and every failure
+# is an R condition naming what the platform said — never a silent NULL. An SDK
+# that swallows an error is a worse outcome than one that has no function for
+# the job, because the app goes on believing it sent something.
+
+api_url <- function() {
+  sub("/+$", "", require_env(ENV_API_URL))
+}
+
+# toft_request performs one call and returns the decoded body.
+#
+# status is checked before the body is parsed, so a proxy's HTML error page
+# becomes "the platform answered 502" rather than a JSON parse error thirty
+# lines away from its cause.
+# `extra_headers` is a named list of request headers, and it is not a
+# convenience.
+#
+# **Three separate features of this SDK each need exactly one request header,
+# and none of them could send it.** The platform reads who a call is on behalf
+# of from `X-Toft-Act-For`, and the app-data precondition from `If-Match`.
+# With no way to set either, `viewer()` relayed the act-for blob as a query
+# parameter the server never looks at — so every viewer resolved to nobody —
+# `job_start()` put it in the body, losing the attribution it was passed to
+# establish, and `app_data_set(if_version =)` sent a precondition that
+# was ignored, quietly turning a compare-and-set into last-write-wins. All three
+# failed silently, which is the one thing the note at the top of this file says
+# an SDK must not do.
+#
+# `token` replaces the app's credential for the one caller that has its own: a
+# job's callbacks to /api/v1/runner/*, made with the run token. `parse = FALSE`
+# returns the response itself, redirects unfollowed, for the one route that
+# answers with a presigned URL the app's token must not be sent to.
+# Seconds the built-in retry waits when a refusal names no Retry-After.
+DEFAULT_RETRY_AFTER <- 2
+
+# Seconds of jitter added to each wait on a 429, so a burst of refused calls
+# does not come back at one instant and meet a single free token together.
+RATE_LIMIT_JITTER <- 0.5
+
+# Seconds one platform round trip may take, and one object-store transfer — the
+# bounds the other three SDKs set. Without them a platform or a store that
+# accepted the connection and stalled held a Shiny or plumber worker forever.
+DEFAULT_TIMEOUT <- 30
+UPLOAD_TIMEOUT <- 300
+
+# store_handle is a curl handle for a URL the platform minted: no Toft header,
+# because the URL is the whole authorization, and the transfer bound.
+store_handle <- function() {
+  curl::new_handle(timeout = UPLOAD_TIMEOUT)
+}
+
+# transport_failure is the condition a request that never got an answer
+# signals — a refused connection, a name that does not resolve, a timeout. A
+# `toft_error` like every other failure here, so `tryCatch(toft_error = )`
+# catches it, and the one kind that is uncoded and retryable: nothing refused
+# the request, so trying again may work. It used to escape as curl's own
+# `curl_error_couldnt_connect`, with no `code` or `retryable` to branch on.
+#
+# `sent` and `timed_out` are what the resend rule reads: a connection that
+# never opened carried nothing, and a timeout spent the call's bound.
+transport_failure <- function(what, cause) {
+  never_sent <- inherits(cause, c("curl_error_couldnt_connect", "curl_error_couldnt_resolve_host",
+                                  "curl_error_couldnt_resolve_proxy"))
+  structure(
+    class = c("toft_error", "error", "condition"),
+    list(message = sprintf("%s: %s", what, conditionMessage(cause)), call = NULL,
+         status = NA_integer_, code = "", retryable = TRUE, hint = NULL,
+         retry_after = NULL, body = list(),
+         sent = !never_sent, timed_out = inherits(cause, "curl_error_operation_timedout"))
+  )
+}
+
+# fetch is curl_fetch_memory with a transport failure turned into that
+# condition. `what` opens its message: "cannot reach Toft at <url>".
+fetch <- function(url, handle, what) {
+  tryCatch(curl::curl_fetch_memory(url, handle = handle),
+           error = function(e) stop(transport_failure(what, e)))
+}
+
+# encode_json is the one way a body becomes JSON here, so NaN and Inf are
+# refused for every call at once. jsonlite writes them as the strings "NaN" and
+# "Inf": a job's params, a run's output and a notification's fields reached the
+# platform as text where a number was — data changed without an error. Python,
+# Node and Go refuse the same value before any request.
+encode_json <- function(value, what = "the request body") {
+  if (has_non_finite(value)) {
+    stop(toft_refusal("bad_request", sprintf(paste0(
+      "%s holds NaN or Inf, which JSON cannot hold — it would arrive as a ",
+      "string in the number's place"), what),
+      hint = "replace NaN and Inf with NULL or a number before sending"))
+  }
+  # digits = NA is full precision (15 significant digits, R's own). jsonlite's
+  # default is four decimal places,
+  # which rewrote 0.00001234 as 0 and 52.520008 as 52.52 in every document,
+  # parameter set and output this SDK sent — with no error, which is exactly
+  # what the check above exists to prevent (code review 2026-11-11, J-1).
+  jsonlite::toJSON(value, auto_unbox = TRUE, null = "null", digits = NA)
+}
+
+# url_escape percent-encodes one path segment or query value, every reserved
+# character, every time. utils::URLencode's default (repeated = FALSE) returns
+# a string that already contains a %HH sequence *unchanged* — spaces, `#`, `?`
+# and `+` beside it included — so an object literally named "Q1%20report.csv"
+# addressed a different object than the one stored (code review 2026-11-11,
+# J-2). Python's quote() and Node's encodeURIComponent always encode; so does
+# this.
+url_escape <- function(x) {
+  # A number as digits: as.character(1e5) is "1e+05", which the platform's
+  # Atoi read as 0, so a log-paging loop restarted from the top at after = 100000
+  # (code review 2026-11-11, J-5).
+  if (is.numeric(x)) x <- format(x, scientific = FALSE, trim = TRUE)
+  utils::URLencode(as.character(x), reserved = TRUE, repeated = TRUE)
+}
+
+toft_request <- function(method, path, body = NULL, query = NULL, extra_headers = NULL,
+                         token = NULL, parse = TRUE) {
+  payload <- if (is.null(body)) NULL else encode_json(body)
+  if (is.null(token)) {
+    token <- app_or_job_token()
+  }
+  url <- paste0(api_url(), path)
+  if (!is.null(query) && length(query)) {
+    parts <- vapply(names(query), function(k) {
+      paste0(url_escape(k), "=",
+             url_escape(query[[k]]))
+    }, character(1))
+    url <- paste0(url, "?", paste(parts, collapse = "&"))
+  }
+
+  handle <- curl::new_handle()
+  headers <- c(
+    "Authorization" = paste("Bearer", token),
+    "Accept" = "application/json"
+  )
+  headers[[CONTRACT_HEADER]] <- APP_CONTRACT_VERSION
+  for (name in names(extra_headers)) {
+    value <- extra_headers[[name]]
+    if (!is.null(value) && nzchar(as.character(value))) {
+      headers[[name]] <- as.character(value)
+    }
+  }
+
+  if (!is.null(payload)) {
+    headers[["Content-Type"]] <- "application/json"
+    curl::handle_setopt(handle, postfields = payload)
+  }
+  # Redirects are never followed, on any call. libcurl drops Authorization on
+  # a cross-host hop but replays the act-for blob and the idempotency key; the
+  # one route that redirects (`parse = FALSE`) is followed by hand, and on any
+  # other a 3xx is refused below, as the Go SDK refuses it.
+  curl::handle_setopt(handle, customrequest = method, followlocation = FALSE,
+                      timeout_ms = round(DEFAULT_TIMEOUT * 1000))
+  curl::handle_setheaders(handle, .list = as.list(headers))
+
+  # One bound for the whole call, both attempts and the wait between them:
+  # "every call gives up after 30 s" is the promise.
+  deadline <- Sys.time() + DEFAULT_TIMEOUT
+  reach <- sprintf("cannot reach Toft at %s", api_url())
+  idempotent <- method == "GET" || "Idempotency-Key" %in% names(headers)
+
+  first <- tryCatch(fetch(url, handle, reach), toft_error = function(e) e)
+  if (inherits(first, "toft_error")) {
+    err <- first
+  } else {
+    resp <- first
+    err <- if (resp$status_code >= 400) toft_error(method, path, resp, response_text(resp)) else NULL
+  }
+  # The rate limiter's 429 is the exception to "one resend": it answers before
+  # any handler runs, so it is waited out -- Retry-After plus a jitter -- for as
+  # long as the bound allows. A single resend paced calls made one at a time but
+  # refused a concurrent burst: every refused call came back at the same
+  # instant, one token was free, and the rest were raised (TOFT-BB-002).
+  if (!is.null(err)) {
+    if (!resendable(err, idempotent)) {
+      stop(err)
+    }
+    limited <- identical(as.integer(err$status), 429L)
+    repeat {
+      wait <- if (is.null(err$retry_after)) DEFAULT_RETRY_AFTER else err$retry_after
+      if (limited) wait <- wait + stats::runif(1, 0, RATE_LIMIT_JITTER)
+      remaining <- as.numeric(deadline - Sys.time(), units = "secs")
+      if (remaining <= wait) {
+        stop(err)
+      }
+      Sys.sleep(wait)
+      remaining <- max(as.numeric(deadline - Sys.time(), units = "secs"), 0.001)
+      curl::handle_setopt(handle, timeout_ms = max(1, round(remaining * 1000)))
+      resp <- fetch(url, handle, reach)
+      if (resp$status_code < 400) break
+      err <- toft_error(method, path, resp, response_text(resp))
+      if (!limited || resp$status_code != 429 || !resendable(err, idempotent)) {
+        stop(err)
+      }
+    }
+  }
+  text <- response_text(resp)
+
+  if (!parse) {
+    return(resp)
+  }
+  if (resp$status_code >= 300) {
+    err <- toft_refusal("unexpected_redirect", sprintf("unexpected redirect from %s", path),
+      hint = paste0("TOFT_API_URL should be the address Toft set for this app; a redirect usually ",
+                    "means it points at a page behind sign-in or at the wrong host"))
+    err$status <- resp$status_code
+    stop(err)
+  }
+  if (!nzchar(trimws(text))) {
+    return(invisible(NULL))
+  }
+  tryCatch(jsonlite::fromJSON(text, simplifyVector = FALSE),
+           error = function(e) stop(not_toft(resp, text)))
+}
+
+response_text <- function(resp) {
+  text <- rawToChar(resp$content)
+  Encoding(text) <- "UTF-8"
+  text
+}
+
+# resendable is whether the single built-in resend fires.
+#
+# **Only a request that cannot have reached a handler, or one harmless to
+# deliver twice.** A 429 is the rate limiter, which answers before any handler
+# runs, and a connection that never opened (a refused connection, a name that
+# does not resolve) delivered nothing: both are resent whatever the method. A
+# 5xx - which a handler may have written after doing the work - or a
+# connection lost once the request was on the wire is resent only for a GET,
+# or a write carrying an Idempotency-Key the platform deduplicates on. A POST
+# with no key, a PUT or a DELETE is not: resending one started a second run.
+# A timeout is never resent; the call's bound is spent. The platform's own
+# `retryable: FALSE` vetoes all of it.
+resendable <- function(err, idempotent) {
+  if (!isTRUE(err$retryable)) {
+    return(FALSE)
+  }
+  if (is.na(err$status)) {
+    if (nzchar(err$code) || isTRUE(err$timed_out)) {
+      return(FALSE)
+    }
+    return(!isTRUE(err$sent) || idempotent)
+  }
+  if (err$status == 429) {
+    return(TRUE)
+  }
+  err$status >= 500 && idempotent
+}
+
+# not_toft is a success whose body is not JSON - a web page, most often: the
+# address names some other server, or a proxy or sign-in page in front of the
+# install. Coded and not retryable, as the CLI's not_toft is: the same address
+# answers the same page next time, and jsonlite's parse error said nothing.
+not_toft <- function(resp, text) {
+  type <- curl::parse_headers_list(resp$headers)[["content-type"]]
+  type <- if (is.null(type)) "" else tolower(type)
+  html <- startsWith(type, "text/html") || startsWith(trimws(text), "<")
+  what <- if (html) "a web page" else "a body that is not JSON"
+  err <- toft_refusal("not_toft",
+    sprintf("%s answered %d with %s, not Toft's API - is %s this install's address?",
+            api_url(), resp$status_code, what, ENV_API_URL),
+    hint = paste0(ENV_API_URL, " is set by Toft for every app and job - check it names the ",
+                  "install's own API, not another server or a proxy or sign-in page in front of it"))
+  err$status <- resp$status_code
+  err
+}
+
+# toft_error is the condition a refusal signals: class "toft_error" before
+# "error", so tryCatch(toft_error = ) catches the platform's refusals and
+# nothing else, and fields read with e$code, e$retryable, e$hint.
+#
+# **Whether to try again is the platform's call.** Every error body the
+# platform writes carries `code`, `retryable` and, for codes that have one,
+# `hint` — the next step in its own words. `retryable` is the platform's answer
+# when the body has one, because only the handler knows that a 503 means "this
+# install is configured without it, forever" or that a 409 means "wait for a
+# run to finish"; the status rule (429 and 5xx) is the fallback for an answer
+# that never reached a handler — a proxy's HTML page, an install older than
+# the envelope. The message is the one this transport has always raised, so
+# code matching it keeps working.
+# toft_refusal is a refusal the SDK makes itself — a name nothing maps, a folder
+# mounted twice, a level too low — as the same `toft_error` condition the
+# platform's refusals are, so `tryCatch(..., toft_error = )` catches both and
+# `e$code` names it. Never retryable: a mapping or a name is wrong, and trying
+# again changes neither — the one exception is a wait that ran out, where the
+# run is still going and waiting again is fair, so `retryable` is an argument.
+# `status` is NA because no request was made. `hint` is the next step, written
+# to be pasted, as the platform's own hints are.
+toft_refusal <- function(code, message, hint = NULL, retryable = FALSE) {
+  body <- list(code = code, retryable = retryable)
+  if (!is.null(hint)) body$hint <- hint
+  structure(
+    class = c("toft_error", "error", "condition"),
+    list(message = message, call = NULL, status = NA_integer_, code = code,
+         retryable = retryable, hint = hint, retry_after = NULL,
+         body = body)
+  )
+}
+
+# store_refusal is an object store's answer to a URL the platform minted: coded,
+# because the store answered — the request reached it and was refused — with the
+# status beside it, and retryable only for what the status rule calls a blip (a
+# throttle, a server error). The other three SDKs raise the same code.
+store_refusal <- function(code, message, status) {
+  retryable <- status == 429 || status >= 500
+  e <- toft_refusal(code, message, retryable = retryable, hint = store_hint(code, retryable))
+  e$status <- as.integer(status)
+  e
+}
+
+# The next step for each object-store refusal, which the store itself never
+# says: its answer is XML for a URL the platform minted, not Toft's envelope.
+store_hint <- function(code, retryable) {
+  if (retryable) {
+    return("the object store is throttling or failing - try again shortly")
+  }
+  switch(code,
+    output_unwritable = paste0("the run's output location is signed for this run and expires with it - ",
+                               "write the output before the run ends, and put anything large in the ",
+                               "app's storage with the output naming it"),
+    output_unreadable = paste0("read the output again; the signed link it is fetched through lasts ",
+                               "minutes, so a stale one is refused"),
+    store_refused = paste0("check the object's name and the app's access level on the store; a signed ",
+                           "URL lasts fifteen minutes, so ask for a fresh one"),
+    "ask for a fresh signed URL and try again")
+}
+
+toft_error <- function(method, path, resp, text) {
+  status <- resp$status_code
+  body <- tryCatch(jsonlite::fromJSON(text, simplifyVector = FALSE),
+                   error = function(e) NULL)
+  if (!is.list(body) || (length(body) && is.null(names(body)))) {
+    body <- list()
+  }
+  detail <- text
+  if (is.character(body$error) && length(body$error) == 1) {
+    detail <- body$error
+  }
+  code <- if (is.character(body$code) && length(body$code) == 1) body$code else ""
+  retryable <- if (is.logical(body$retryable) && length(body$retryable) == 1 &&
+                   !is.na(body$retryable)) {
+    body$retryable
+  } else {
+    status == 429 || (status >= 500 && status != 501)
+  }
+  hint <- if (is.character(body$hint) && length(body$hint) == 1 && nzchar(body$hint)) {
+    body$hint
+  } else {
+    NULL
+  }
+  retry_after <- NULL
+  header <- curl::parse_headers_list(resp$headers)[["retry-after"]]
+  if (!is.null(header)) {
+    seconds <- suppressWarnings(as.numeric(header))
+    if (!is.na(seconds) && seconds >= 0) retry_after <- seconds
+  }
+  structure(
+    class = c("toft_error", "error", "condition"),
+    list(
+      message = sprintf("Toft %s %s failed (%d): %s", method, path, status, detail),
+      call = NULL,
+      status = status,
+      code = code,
+      retryable = retryable,
+      hint = hint,
+      retry_after = retry_after,
+      body = body
+    )
+  )
+}
+
+# The app's own token in its service process; inside a job, which holds no app
+# token, the run's own credential - accepted by the platform for sending through
+# the app's integrations and nothing else (ADR §108). So notify() works from a
+# job, and app_data_get() from a job is refused with job_send_only.
+app_or_job_token <- function() {
+  token <- trimws(Sys.getenv(ENV_APP_TOKEN, ""))
+  if (nzchar(token)) {
+    return(token)
+  }
+  if (nzchar(trimws(Sys.getenv(ENV_RUN_ID, "")))) {
+    job <- trimws(Sys.getenv("TOFT_JOB_TOKEN", ""))
+    if (nzchar(job)) {
+      return(job)
+    }
+  }
+  require_env(ENV_APP_TOKEN)
+}

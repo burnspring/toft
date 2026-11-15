@@ -1,0 +1,799 @@
+/**
+ * The HTTP transport for `/api/v1/app/*`.
+ *
+ * No dependencies, on purpose. This runs inside somebody's app beside their own
+ * tree, and a version conflict between our HTTP library and theirs would be our
+ * bug appearing in their build. Node 18's built-in `fetch` is enough.
+ *
+ * Two things here are worth reading before changing them, and they are the same
+ * two the Python transport carries — the two libraries have to behave
+ * identically or an app written in one observes a platform the other cannot.
+ *
+ * **The retry is exactly one, and it is not a retry policy.** The platform's own
+ * queue does the real work. This covers the far narrower case of a request that
+ * never reached a handler — a 429 from the rate limiter, a connection that never
+ * carried it — or one harmless to deliver twice: a GET, or a write with an
+ * Idempotency-Key. See `resendable`.
+ *
+ * **A retried request reuses its idempotency key.** Without that, this retry is
+ * precisely the thing that starts the same job twice.
+ */
+
+import { createReadStream } from "node:fs";
+import http from "node:http";
+import https from "node:https";
+
+const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_RETRY_AFTER_MS = 2_000;
+// Added to each wait on a 429, so a burst of refused calls does not come back
+// at one instant and meet a single free token together.
+const RATE_LIMIT_JITTER_MS = 500;
+
+/**
+ * How long one object-store transfer may take — a presigned GET or PUT. Five
+ * minutes, as in the other three SDKs: undici's own idle timeouts are all that
+ * bounded these before, and a slow-dripping store could hold a request past
+ * the gateway's deadline.
+ */
+export const UPLOAD_TIMEOUT_MS = 300_000;
+
+/**
+ * A request to the object store over a URL the platform minted: no Toft header
+ * (the URL is the whole authorization), and the transfer bound above. Rejects
+ * with the plain `fetch` error, so each caller keeps its own sentence; a
+ * timeout is a ToftError that says so.
+ */
+export async function fetchStore(url, init = {}) {
+  try {
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS) });
+  } catch (err) {
+    if (err.name === "TimeoutError" || err.name === "AbortError") {
+      throw new ToftError(`the object store did not finish within ${UPLOAD_TIMEOUT_MS}ms`);
+    }
+    throw err;
+  }
+}
+
+/**
+ * A signed PUT of a local file, streamed from disk with its length declared.
+ *
+ * `fetch` with a stream body sends it chunked, and the signed request carries
+ * the size, so this is `node:http(s)` with `Content-Length` set and the file
+ * piped in — never the whole file in memory: an app under a memory limit could
+ * not otherwise upload anything larger than that limit (security review
+ * 2026-11-14, CS-11). `fs.openAsBlob` would do it through `fetch`, but the
+ * package supports Node 18. The same five-minute bound as `fetchStore`;
+ * resolves `{status, statusText}` and rejects with the plain error, so the
+ * caller keeps its own sentence.
+ */
+export function putStoreFile(url, { method = "PUT", headers = {} } = {}, file, size) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const lib = target.protocol === "https:" ? https : http;
+    let settled = false;
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn(value);
+    };
+    const req = lib.request(target, { method, headers: { ...headers, "Content-Length": String(size) } }, (resp) => {
+      resp.resume();
+      resp.on("end", () => settle(resolve, { status: resp.statusCode, statusText: resp.statusMessage || "" }));
+      resp.on("error", (err) => settle(reject, err));
+    });
+    const timer = setTimeout(() => {
+      const err = new ToftError(`the object store did not finish within ${UPLOAD_TIMEOUT_MS}ms`);
+      req.destroy(err);
+      settle(reject, err);
+    }, UPLOAD_TIMEOUT_MS);
+    req.on("error", (err) => settle(reject, err));
+    if (size === 0) {
+      req.end();
+      return;
+    }
+    // No further than the size that was hashed and signed: a file still being
+    // written is a short or long body the store refuses, never bytes the
+    // digests did not cover.
+    const stream = createReadStream(file, { start: 0, end: size - 1 });
+    stream.on("error", (err) => {
+      req.destroy(err);
+      settle(reject, err);
+    });
+    stream.pipe(req);
+  });
+}
+
+/**
+ * A redirect on an ordinary call is the platform answering a question the
+ * method did not ask. Refused rather than followed: `fetch` replays custom
+ * headers — the act-for blob, the idempotency key — to whatever host the
+ * Location names. Only `follow` has a redirect to deal with, by hand.
+ */
+export function refuseRedirect(resp, path) {
+  if (resp.status >= 300 && resp.status < 400) {
+    // Coded and hinted as R has it (BB-113): it was code "" and hint null.
+    throw refusal("unexpected_redirect", `unexpected redirect from ${path}`, {
+      status: resp.status,
+      hint: REDIRECT_HINT,
+    });
+  }
+}
+
+/** The next step for a redirect the SDK will not follow — R's words. */
+export const REDIRECT_HINT =
+  "TOFT_API_URL should be the address Toft set for this app; a redirect usually " +
+  "means it points at a page behind sign-in or at the wrong host";
+
+/** The app contract version this SDK speaks, sent on every call. */
+export const APP_CONTRACT_VERSION = "1";
+export const CONTRACT_HEADER = "X-Toft-App-Contract";
+
+export const ENV_APP_TOKEN = "TOFT_APP_TOKEN";
+export const ENV_API_URL = "TOFT_API_URL";
+
+// Not read for their values here, only to tell one absence from another: inside
+// a job the app token is *meant* to be missing, and the run id is exactly the
+// condition "we are inside a job".
+export const ENV_RUN_ID = "TOFT_RUN_ID";
+export const ENV_JOB_NAME = "TOFT_JOB_NAME";
+
+/**
+ * An error from the platform.
+ *
+ * `status` tells "you asked for something impossible" from "try again later".
+ * `body` is the decoded refusal, because some of them carry figures an app can
+ * render — a full queue says how many runs are in flight and what the limit is
+ * — and flattening those into a message string throws away the only part that
+ * could go on a page. `code` is the stable name to branch on, rather than prose
+ * that may be reworded.
+ *
+ * **Whether to try again is the platform's call, not this class's.** Every
+ * error body the platform writes carries `code`, `retryable` and, for codes
+ * that have one, `hint` — the next step in its own words. `retryable` returns
+ * the platform's answer when the body has one, because only the handler knows
+ * that a 503 means "this install is configured without it, forever" or that a
+ * 409 means "wait for a run to finish". The status rule is the fallback for
+ * refusals that never reached a handler: a transport failure, a proxy's HTML
+ * page, an install older than the envelope.
+ */
+export class ToftError extends Error {
+  constructor(message, { status, retryAfter, body, offPlatform } = {}) {
+    super(message);
+    this.name = "ToftError";
+    this.status = status;
+    this.retryAfter = retryAfter;
+    this.body = body ?? {};
+    /**
+     * Set on the one refusal that no retry can help: a variable the platform
+     * injects is not there. Without it the missing-environment error looks
+     * exactly like a network failure — no status — and this transport slept two
+     * seconds before raising the identical error a second time. The environment
+     * does not arrive while a process waits.
+     */
+    this.offPlatform = Boolean(offPlatform);
+  }
+
+  get code() {
+    return this.body.code ?? "";
+  }
+
+  get retryable() {
+    if (this.offPlatform) return false;
+    if (typeof this.body.retryable === "boolean") return this.body.retryable;
+    return this.#statusRetryable();
+  }
+
+  /**
+   * The platform's next step for this refusal — "mint a new key", "an
+   * administrator has to lift the lock" — or undefined when it sent none.
+   * Written for whoever reads the failure, so an app logging the error should
+   * log this too.
+   */
+  get hint() {
+    return typeof this.body.hint === "string" && this.body.hint ? this.body.hint : undefined;
+  }
+
+  #statusRetryable() {
+    return this.status === undefined || this.status >= 500 || this.status === 429;
+  }
+
+  /**
+   * Whether the transport's single built-in retry fires. Narrower than
+   * `retryable` on purpose: that retry covers a request that never reached a
+   * handler — a rate limiter, a gateway — so the platform can veto it (a 503
+   * saying "not configured" is not slept over) but cannot widen it to a 4xx. A
+   * 409 the platform calls retryable means "wait for something", and how long
+   * is the caller's loop to decide, not two seconds here.
+   */
+  get autoRetry() {
+    return this.retryable && this.#statusRetryable();
+  }
+}
+
+/**
+ * A refusal this SDK makes itself, before or instead of a request: coded, and
+ * never retryable. Without a body the status rule reads a statusless error as a
+ * network failure — code "" and retryable true — and an agent's loop retries a
+ * missing file forever. Only a real transport failure leaves the body empty.
+ */
+export function refusal(code, message, { hint, ...options } = {}) {
+  const body = { code, retryable: false };
+  if (hint) body.hint = hint;
+  return new ToftError(message, { ...options, body });
+}
+
+/**
+ * The options object a call was given, held to the options it takes: anything
+ * else is `bad_request` before any request, with the call's own example as the
+ * hint — never dropped. A dropped option is a caller who believes it took
+ * effect: `data.set(doc, { if_version: 3 })` was an unconditional write, and
+ * `storage("x", { fold: "a" })` the resource's root. `undefined` and `null`
+ * are "no options"; a key whose value is `undefined` is one not given. A
+ * snake_case spelling of an option the call does take is named in the hint,
+ * because that is the mistake a reader of the Python SDK makes.
+ */
+export function takeOptions(call, options, allowed, example) {
+  if (options === undefined || options === null) return {};
+  if (typeof options !== "object" || Array.isArray(options)) {
+    throw refusal("bad_request",
+      `${call} takes an options object, got ${Array.isArray(options) ? "an array" : JSON.stringify(options) ?? typeof options}`,
+      { hint: example });
+  }
+  const unknown = Object.keys(options).filter((k) => options[k] !== undefined && !allowed.includes(k));
+  if (unknown.length) {
+    const camel = unknown
+      .map((k) => [k, k.replace(/_([a-z])/g, (_, c) => c.toUpperCase())])
+      .filter(([k, c]) => c !== k && allowed.includes(c))
+      .map(([k, c]) => `${c}, not ${k}`);
+    const takes = allowed.length ? `it takes ${allowed.join(", ")}` : "it takes no options";
+    throw refusal("bad_request", `${call} does not take ${unknown.join(", ")} — ${takes}`,
+      { hint: camel.length ? `${camel.join("; ")}: ${example}` : example });
+  }
+  return options;
+}
+
+/**
+ * The arguments past the ones a call takes, refused: a call with no options
+ * object is still handed one — `jobs.get(id, { bogus: 1 })`, `data.get({…})` —
+ * and JavaScript drops it without a word, which reads as an option taken
+ * (BB-066). `undefined` past the end is no argument.
+ */
+export function noMoreArgs(call, args, takes, example) {
+  const extra = Array.prototype.slice.call(args, takes).filter((a) => a !== undefined);
+  if (!extra.length) return;
+  const isOptions = (a) => a !== null && typeof a === "object" && !Array.isArray(a);
+  const named = extra.map((a) =>
+    isOptions(a) ? Object.keys(a).join(", ") || "{}" : JSON.stringify(a) ?? typeof a);
+  // A positional value is not an option: `download("a.txt", "/tmp/x")` is told
+  // how many arguments the call takes (BB-096).
+  const takesWhat = extra.some(isOptions) ? "it takes no options"
+    : `it takes ${takes === 1 ? "one argument" : `${takes} arguments`}`;
+  throw refusal("bad_request", `${call} does not take ${named.join(", ")} — ${takesWhat}`,
+    { hint: example });
+}
+
+/**
+ * An object store's answer to a URL the platform minted. Coded, because the
+ * request reached the store and was refused — statusless and uncoded is for a
+ * request that never got an answer — with the status beside it, and retryable
+ * only for what the status rule calls a blip: a throttle or a server error. A
+ * 403 used to come back code "" and not retryable, the one combination the
+ * contract says never happens.
+ */
+export function storeRefusal(code, message, status) {
+  return new ToftError(message, {
+    status,
+    body: { code, retryable: status === 429 || status >= 500 },
+  });
+}
+
+/**
+ * JSON for a request body, refusing what JSON cannot carry. `JSON.stringify`
+ * writes `NaN` and `±Infinity` as `null`, so a document holding one was stored
+ * with the number silently gone — data lost without an error. Python's
+ * `allow_nan=False` and Go's encoder refuse it; so does this, as `bad_request`
+ * before any request, naming where the value sat.
+ */
+export function toJson(value) {
+  return JSON.stringify(value, function (key, v) {
+    if (typeof v === "number" && !Number.isFinite(v)) {
+      const where = key === "" ? "the value" : `"${key}"`;
+      throw refusal("bad_request",
+        `${where} is ${v}, which JSON cannot carry — store a number, null or a string instead`,
+        { hint: "replace NaN and Infinity before sending: null, or a string like \"NaN\"" });
+    }
+    return v;
+  });
+}
+
+/**
+ * A local file the SDK was asked to read, as a refusal when it cannot be:
+ * `not_found` for a path that is not there, `bad_request` for anything else
+ * (a directory, a permission). Neither is helped by trying again.
+ */
+export function fileRefusal(err, what, verb = "read", hint) {
+  const missing = err?.code === "ENOENT" || err?.code === "ENOTDIR";
+  const code = missing ? "not_found" : "bad_request";
+  // Every refusal the SDK raises itself carries a hint (BB-082): the caller's
+  // own file, named, and what to check.
+  const fallback = missing
+    ? `check the path: ${JSON.stringify(String(what))} does not exist on this machine`
+    : `check that this process can ${verb} ${JSON.stringify(String(what))}`;
+  return refusal(code, `cannot ${verb} ${what}: ${err?.message ?? err}`, { hint: hint ?? fallback });
+}
+
+/**
+ * Whether this process looks like it runs on Toft at all: the platform
+ * injects at least one of these into every app and every job. Used only to
+ * tell "off the platform" from "on it, with nothing mapped" in a refusal.
+ */
+export function onPlatform() {
+  return ["TOFT_API_URL", "TOFT_APP_ID", "TOFT_RUN_ID", "TOFT_SCRATCH_DIR"].some(
+    (name) => (process.env[name] ?? "").trim() !== "",
+  );
+}
+
+/**
+ * Read an injected variable, or throw naming what sets it.
+ *
+ * The message names the variable rather than describing the situation, because
+ * the fix is always the same: run this on Toft. There is deliberately no
+ * dry-run mode — an SDK that quietly did nothing off-platform is a trap that
+ * only springs in production.
+ */
+export function require_(name) {
+  const value = (process.env[name] ?? "").trim();
+  if (value) return value;
+  throw new ToftError(missing(name), {
+    offPlatform: true,
+    body: { code: missingCode(name), retryable: false, hint: missingHint(name) },
+  });
+}
+
+/**
+ * The next step for a missing variable. Inside a job the variable is absent by
+ * design — the app token and `TOFT_APP_ID` belong to the service process — so
+ * the step is to move the call, not to fix a deploy.
+ */
+function missingHint(name) {
+  if ((process.env[ENV_RUN_ID] ?? "").trim()) {
+    if (name === ENV_APP_TOKEN) {
+      return "do this from the service process, or write the result with run.writeOutputJson(...) and let an endpoint read it";
+    }
+    return `${name} belongs to the service process, not a job — read it there, or pass it to the job as a param`;
+  }
+  return `run this in an app deployed on Toft; to try it locally, set ${name} yourself`;
+}
+
+/**
+ * The code missing()'s sentence carries: job_send_only — the platform's own
+ * word for the same rule — when a job asked for the app token, off_platform
+ * otherwise. Neither is helped by trying again.
+ */
+function missingCode(name) {
+  return name === ENV_APP_TOKEN && (process.env[ENV_RUN_ID] ?? "").trim() ? "job_send_only" : "off_platform";
+}
+
+/**
+ * Why the variable is absent, in the two cases that differ.
+ *
+ * **The app token missing inside a job is not a broken deploy.** A job workload
+ * is given none, deliberately: the app's credential belongs to the process
+ * serving its requests, and a job serves none. The generic sentence is actively
+ * misleading there — it tells an author running a deployed app on the platform
+ * that they are not running on the platform, and sends them looking for a
+ * missing variable, a broken deploy or a platform bug. The answer is
+ * architectural, so it has to be in the sentence.
+ *
+ * `TOFT_RUN_ID` is what says we are inside a job; the runner exports it
+ * for every run and for nothing else. Same branch, same wording, in all four
+ * SDKs — an author who moves language must not meet a different explanation of
+ * one platform rule.
+ */
+function missing(name) {
+  const runId = (process.env[ENV_RUN_ID] ?? "").trim();
+  if (name === ENV_APP_TOKEN && runId) {
+    const job = (process.env[ENV_JOB_NAME] ?? "").trim();
+    const where = job ? `job "${job}", run ${runId}` : `run ${runId}`;
+    return (
+      `${name} is not set because this is a job (${where}), and a job is deliberately ` +
+      `given no app token — this is not a broken deploy. toft.data, toft.app and toft.notify ` +
+      `belong to the process serving this app's requests, and a job serves none. Two ways ` +
+      `round it: do this from the service process, or carry the result out of the run with ` +
+      `run.writeOutputJson(...) and let an endpoint fold it in.`
+    );
+  }
+  return (
+    `${name} is not set. This call needs the environment Toft injects into a ` +
+    `deployed app — it only works in an app running on the platform.`
+  );
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+export class AppTransport {
+  constructor({ baseUrl, token, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+    this._baseUrl = baseUrl;
+    this._token = token;
+    this._timeoutMs = timeoutMs;
+  }
+
+  // Built lazily from the environment on first use, so importing the package
+  // off-platform never throws — only calling something that needs the platform
+  // does.
+  get baseUrl() {
+    return (this._baseUrl ??= require_(ENV_API_URL)).replace(/\/$/, "");
+  }
+
+  // The app's own token in its service process; inside a job, which holds no
+  // app token, the run's own credential — accepted by the platform for sending
+  // through the app's integrations and nothing else (ADR §108). So `notify`
+  // works from a job, and `data` from a job is refused with `job_send_only`.
+  get token() {
+    if (this._token == null) {
+      const app = (process.env[ENV_APP_TOKEN] ?? "").trim();
+      const job = (process.env.TOFT_JOB_TOKEN ?? "").trim();
+      const inRun = (process.env.TOFT_RUN_ID ?? "").trim() !== "";
+      this._token = app || (inRun && job) || require_(ENV_APP_TOKEN);
+    }
+    return this._token;
+  }
+
+  async get(path, headers) {
+    return this.#attempt("GET", path, undefined, headers);
+  }
+
+  /**
+   * PUT a JSON body — one resource replaced, rather than one thing enqueued.
+   *
+   * No idempotency key, on purpose: a PUT already replaces the same resource
+   * whatever the attempt number, so the key that keeps a retried POST from
+   * starting two runs has nothing to protect here. `If-Match` is the header
+   * that matters instead, and it belongs to the caller.
+   */
+  async putJson(path, body, { headers } = {}) {
+    return this.#attempt("PUT", path, body ?? {}, headers);
+  }
+
+  async del(path, headers) {
+    return this.#attempt("DELETE", path, undefined, headers);
+  }
+
+  async postJson(path, body, { idempotencyKey, headers } = {}) {
+    const merged = { ...(headers ?? {}) };
+    if (idempotencyKey) merged["Idempotency-Key"] = idempotencyKey;
+    return this.#attempt("POST", path, body ?? {}, merged);
+  }
+
+  /**
+   * POST fields and files as multipart/form-data.
+   *
+   * Attachments travel this way rather than base64 inside a JSON body: a 10 MiB
+   * report becomes a 13 MiB string that then has to be decoded into a second
+   * 10 MiB buffer, and paying that on the platform's heap for the tidiness of a
+   * single content type is not a trade worth making. Same reasoning, same wire
+   * format, as the Python transport — the two libraries have to behave
+   * identically or an app written in one observes a platform the other cannot.
+   *
+   * Node's built-in FormData is used precisely so this stays dependency-free,
+   * and the Content-Type is left unset on purpose: `fetch` fills it in with the
+   * boundary it generated, and one supplied here would be missing that boundary.
+   */
+  async postMultipart(path, fields, parts, { idempotencyKey, headers } = {}) {
+    const form = new FormData();
+    for (const [name, value] of Object.entries(fields ?? {})) {
+      if (value !== undefined && value !== null) form.append(name, String(value));
+    }
+    for (const part of parts ?? []) {
+      form.append(
+        part.field,
+        new Blob([part.content], { type: part.contentType }),
+        part.filename,
+      );
+    }
+    const merged = { ...(headers ?? {}) };
+    if (idempotencyKey) merged["Idempotency-Key"] = idempotencyKey;
+    return this.#attemptForm(path, form, merged);
+  }
+
+  async #attemptForm(path, form, headers) {
+    return this.#attempt("POST", path, form, headers, true);
+  }
+
+  /**
+   * GET a route that redirects to an object store, and return the bytes.
+   *
+   * The redirect is followed by hand. `fetch` would replay this app's platform
+   * token to whatever host the store lives on — a credential leak in exchange
+   * for one saved option — so the second request carries no Toft headers
+   * at all. A presigned URL is already the whole authorization.
+   *
+   * Resolves with `null` when the platform says there is nothing to fetch
+   * (`no_output`); any other refusal — an expired artifact, a run that is not
+   * there — throws with the platform's own words.
+   */
+  async follow(path, headers) {
+    const resp = await this.#fetch("GET", path, undefined, headers, "manual");
+    if (resp.status === 404) {
+      const err = errorFromText(resp, await resp.text());
+      // An install older than the envelope sent no code; its 404 here meant
+      // the same "nothing was written".
+      if (err.code === "no_output" || err.code === "") return null;
+      throw err;
+    }
+    if (resp.status >= 300 && resp.status < 400) {
+      const location = resp.headers.get("Location");
+      if (!location) {
+        throw refusal("unexpected_response", "the platform redirected without a location", {
+          status: resp.status,
+          hint: REDIRECT_HINT,
+        });
+      }
+      let object;
+      try {
+        object = await fetchStore(location);
+      } catch (err) {
+        if (err instanceof ToftError) throw err;
+        throw new ToftError(`fetching the object: ${err.message}`);
+      }
+      if (!object.ok) {
+        throw storeRefusal("output_unreadable", `fetching the object: ${object.status} ${object.statusText}`,
+          object.status);
+      }
+      return new Uint8Array(await object.arrayBuffer());
+    }
+    if (!resp.ok) throw await errorFrom(resp);
+    return new Uint8Array(await resp.arrayBuffer());
+  }
+
+  /**
+   * One call: an attempt, and at most one resend when `resendable` allows it,
+   * all inside the one bound — "every call gives up after 30 s" is the promise,
+   * and a fresh bound per attempt made a stalled platform cost a minute.
+   *
+   * The rate limiter's 429 is the exception to "one resend": it answers before
+   * any handler runs, so it is waited out — Retry-After plus a jitter — for as
+   * long as the bound allows. A single resend paced calls made one at a time
+   * but refused a concurrent burst: every refused call came back at the same
+   * instant, one token was free, and the rest were raised (TOFT-BB-002).
+   */
+  async #attempt(method, path, body, headers, form = false) {
+    const deadline = Date.now() + this._timeoutMs;
+    let err;
+    try {
+      return await this.#once(method, path, body, headers, form, this._timeoutMs);
+    } catch (e) {
+      err = e;
+    }
+    if (!(err instanceof ToftError) || !resendable(method, headers, err)) throw err;
+    for (;;) {
+      const limited = err.status === 429;
+      const wait = (err.retryAfter !== undefined ? err.retryAfter * 1000 : DEFAULT_RETRY_AFTER_MS)
+        + (limited ? Math.random() * RATE_LIMIT_JITTER_MS : 0);
+      if (deadline - Date.now() <= wait) throw err;
+      await sleep(wait);
+      try {
+        return await this.#once(method, path, body, headers, form, Math.max(deadline - Date.now(), 1));
+      } catch (e) {
+        if (!limited || !(e instanceof ToftError) || e.status !== 429 || !resendable(method, headers, e)) throw e;
+        err = e;
+      }
+    }
+  }
+
+  /**
+   * One attempt, its answer read under the same timer as the request: a
+   * platform that sent its headers and stalled the body was unbounded.
+   */
+  async #once(method, path, body, headers, form, timeoutMs) {
+    // Serialized before the timer starts: a refusal of the body is not a
+    // network failure, and nothing should be in flight when it is thrown.
+    const json = form || body === undefined ? undefined : toJson(body);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let resp;
+    let text;
+    try {
+      try {
+        resp = await fetch(`${this.baseUrl}${path}`, {
+          method,
+          redirect: "manual",
+          signal: controller.signal,
+          headers: {
+            Authorization: `Bearer ${this.token}`,
+            [CONTRACT_HEADER]: APP_CONTRACT_VERSION,
+            ...(form || body === undefined ? {} : { "Content-Type": "application/json" }),
+            ...(headers ?? {}),
+          },
+          body: form ? body : json,
+        });
+      } catch (err) {
+        // Our own refusal, raised while composing the request — the lazy
+        // `token` getter is the one that does this — is rethrown untouched.
+        if (err instanceof ToftError) throw err;
+        throw this.#unreachable(err, !neverConnected(err));
+      }
+      try {
+        text = await resp.text();
+      } catch (err) {
+        throw this.#unreachable(err, true);
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+    refuseRedirect(resp, path);
+    if (!resp.ok) throw errorFromText(resp, text);
+    if (!text.trim()) return null;
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw notToft(this.baseUrl, resp, text);
+    }
+  }
+
+  /**
+   * A request that got no answer: uncoded and retryable, and how far it got.
+   * A timeout names the call's whole bound, not the share of it the resend had
+   * left (BB-015): "within 7273ms" read as a bound nobody set.
+   */
+  #unreachable(err, sent) {
+    const timedOut = err?.name === "AbortError" || err?.name === "TimeoutError";
+    const out = new ToftError(timedOut
+      ? `Toft did not answer within ${seconds(this._timeoutMs)}`
+      : `cannot reach Toft at ${this.baseUrl}: ${err?.message ?? err}`);
+    out.sent = timedOut || sent;
+    out.timedOut = timedOut;
+    return out;
+  }
+
+  async #fetch(method, path, body, headers, redirect) {
+    // Serialized before the timer starts: a refusal of the body is not a
+    // network failure, and nothing should be in flight when it is thrown.
+    const json = body === undefined ? undefined : toJson(body);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this._timeoutMs);
+    try {
+      return await fetch(`${this.baseUrl}${path}`, {
+        method,
+        redirect,
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+          [CONTRACT_HEADER]: APP_CONTRACT_VERSION,
+          ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+          ...(headers ?? {}),
+        },
+        body: json,
+      });
+    } catch (err) {
+      // Our own refusal, raised while composing the request rather than by the
+      // network — the lazy `token` getter is the one that does this. Rethrown
+      // untouched: wrapping it in "cannot reach Toft at …" buried the real
+      // sentence inside a second one that named the wrong problem, and made a
+      // refusal no retry can help look like a network failure worth retrying.
+      if (err instanceof ToftError) throw err;
+      if (err.name === "AbortError") {
+        throw new ToftError(`Toft did not answer within ${seconds(this._timeoutMs)}`);
+      }
+      throw new ToftError(`cannot reach Toft at ${this.baseUrl}: ${err.message}`);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
+/**
+ * Whether the single built-in resend fires.
+ *
+ * **Only a request that cannot have reached a handler, or one harmless to
+ * deliver twice.** A 429 is the rate limiter, which answers before any handler
+ * runs, and a connection that never opened delivered nothing: both are resent
+ * whatever the method. A 5xx — which a handler may have written after doing the
+ * work — or a connection lost once the request was on the wire is resent only
+ * for a GET, or a write carrying an Idempotency-Key the platform deduplicates
+ * on. A POST with no key, a PUT or a DELETE is not. A timeout is never resent:
+ * the call's bound is spent. The platform's own `retryable: false` vetoes all
+ * of it.
+ */
+export function resendable(method, headers, err) {
+  const idempotent = method === "GET" || Boolean(headers?.["Idempotency-Key"]);
+  if (err.status === undefined) {
+    if (err.code || err.offPlatform || err.timedOut || err.sent === undefined) return false;
+    return !err.sent || idempotent;
+  }
+  if (!err.autoRetry) return false;
+  return err.status === 429 || idempotent;
+}
+
+// The failures that happen before a connection carries anything: a name that
+// does not resolve, a port nobody listens on, a connect that timed out.
+const NEVER_CONNECTED = new Set([
+  "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
+
+// A bound in the unit the other SDKs name it in: 30000 is "30s", 1500 "1.5s".
+function seconds(ms) {
+  return `${Number((ms / 1000).toFixed(3))}s`;
+}
+
+function neverConnected(err) {
+  for (let e = err; e; e = e.cause) {
+    if (NEVER_CONNECTED.has(e.code)) return true;
+    // fetch refuses a port on its blocked list (1, 25, 6000, …) before it
+    // opens anything, with an uncoded "bad port" (BB-004): nothing was sent.
+    if (e !== err && e.message === "bad port") return true;
+    if (Array.isArray(e.errors) && e.errors.some((x) => NEVER_CONNECTED.has(x?.code))) return true;
+  }
+  return false;
+}
+
+/**
+ * A success whose body is not JSON — a web page, most often: the address names
+ * some other server, or a proxy or sign-in page in front of the install. Coded
+ * and not retryable, as the CLI's `not_toft` is: the same address answers the
+ * same page next time, and a bare SyntaxError told an agent nothing.
+ */
+export function notToft(base, resp, text) {
+  const html = (resp.headers.get("Content-Type") ?? "").toLowerCase().startsWith("text/html")
+    || text.trimStart().startsWith("<");
+  const what = html ? "a web page" : "a body that is not JSON";
+  return refusal("not_toft",
+    `${base} answered ${resp.status} with ${what}, not Toft's API — is ${ENV_API_URL} this install's address?`,
+    {
+      status: resp.status,
+      hint: `${ENV_API_URL} is set by Toft for every app and job — check it names the install's own API, ` +
+        "not another server or a proxy or sign-in page in front of it",
+    });
+}
+
+async function errorFrom(resp) {
+  return errorFromText(resp, await resp.text());
+}
+
+/**
+ * Turn the platform's error body into the message a developer reads.
+ *
+ * Refusals from `/api/v1/app/*` are written for a person and name the remedy.
+ * Flattening one into "403 Forbidden" throws away the only part that helps.
+ */
+export function errorFromText(resp, text) {
+  let body = {};
+  let detail = text;
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object") {
+      body = parsed;
+      detail = parsed.error ?? text;
+    }
+  } catch {
+    /* the body was not JSON; the raw text is the best message available */
+  }
+  const header = resp.headers.get("Retry-After");
+  const retryAfter = header ? Number(header) : undefined;
+  return new ToftError(detail || resp.statusText, {
+    status: resp.status,
+    retryAfter: Number.isFinite(retryAfter) ? retryAfter : undefined,
+    body,
+  });
+}
+
+/**
+ * The process-wide transport, built on first use.
+ *
+ * One connection story for the whole SDK, so `toft.app` and `toft.jobs` cannot end
+ * up talking to two different places. `resetTransport` exists for tests;
+ * nothing in normal app code calls it.
+ */
+let shared = null;
+
+export function transport() {
+  noMoreArgs("transport()", arguments, 0, "transport()");
+  return (shared ??= new AppTransport());
+}
+
+export function resetTransport(t = null) {
+  noMoreArgs("resetTransport()", arguments, 1, "resetTransport(new AppTransport({ baseUrl, token }))");
+  shared = t;
+}

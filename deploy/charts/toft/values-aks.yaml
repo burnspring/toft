@@ -1,0 +1,178 @@
+# Toft on AKS.
+#
+# The peer of a values file for EKS, and it is a *shape* rather than an install:
+# every id below is a placeholder, and `docs/deploy-aks.md` is where they come
+# from. Use it as `helm install -f values.yaml -f values-aks.yaml`.
+#
+# What is Azure-specific here is four things and no more, which is the point of
+# the whole design: each seam is selected on its own and there is no CLOUD
+# value. An install that ran AKS against an S3-compatible on-premises object
+# store would take the compute half of this file and none of the storage half,
+# and that shape is supported rather than special-cased (ADR §82).
+#
+#   1. artifactStore.type: azblob      — releases published to a container
+#   2. appStorage.blob.account         — Azure Blob object stores, if wanted
+#   3. encryptionKeyURI: azurekeyvault — the key that encrypts the data key
+#   4. serviceAccount.azureWorkloadIdentity — how all three authenticate
+#
+# **Before any of it: the policy engine.** `--network-policy azure` (or
+# `cilium`) is an `az aks create` flag and CANNOT be added to an existing
+# cluster. Without one, `blockAwsMetadata` below writes a NetworkPolicy that
+# nothing enforces, and a deployed app can reach 169.254.169.254 and take the
+# identity of the node it runs on. Nothing in this chart or in Toft can
+# detect that, which is why the sentence is here and in NOTES.txt and in the
+# deploy document, and why it is a decision made before the install.
+
+# The platform image you built and pushed to your registry (no image is
+# published): docker build -t REPLACE.azurecr.io/toft:<version> .
+image:
+  repository: REPLACE.azurecr.io/toft
+
+platform:
+  baseUrl: https://toft.example.com
+  # A second origin, which is what keeps an app's JavaScript off the platform's
+  # origin. Set it equal to baseUrl only to choose single-origin deliberately.
+  appsBaseUrl: https://apps.example.com
+  # The ingress controller below is a pod, not loopback. Left at the default,
+  # the platform ignores its X-Forwarded-Proto and mints http:// links on an
+  # https:// install — the chart's own lint refuses the combination.
+  #
+  # A placeholder for the pod subnet of a node pool that runs only the
+  # application-routing controller (Azure CNI with a pod subnet per pool;
+  # docs/deploy-aks.md § Who may reach it). NOT the cluster's pod CIDR: that
+  # holds every isolated app too, and any peer in this range may name the
+  # client. With networkPolicy on (below) an app cannot reach the port this is
+  # believed on, so the pod CIDR here would cost what a pod outside the apps
+  # namespace could forge; without the policy it costs what any app could.
+  trustedProxyCidrs: "10.225.0.0/24"
+
+# The platform pod's own ingress (values.yaml `networkPolicy`, on by default):
+# the apps namespace reaches only the callback port, every other namespace every
+# port. Application routing's controller is a pod in app-routing-system, so no
+# address needs listing. A controller on host networking, or a Service of type
+# LoadBalancer, would need platformSourceCidrs — and on Azure CNI powered by
+# Cilium an ipBlock never matches another node, so reach the pod through a pod.
+networkPolicy:
+  enabled: true
+  platformSourceCidrs: []
+
+# Managed Postgres. The bundled one is a fixture — one replica, no backups, no
+# failover — and DATABASE_URL reaches Azure Database for PostgreSQL with no
+# special case at all, which is why there is no setting for it here.
+postgres:
+  enabled: false
+secrets:
+  existingSecret: toft-secrets
+
+# -- The four Azure seams -----------------------------------------------------
+
+artifactStore:
+  enabled: true
+  type: azblob
+  # The container. The key keeps its name on every backend: renaming what
+  # crosses the API, the CLI, the SPA and the audit log to gain a synonym is
+  # churn with a migration attached.
+  bucket: toft-releases
+  # Required by azblob. The service URL is derived from it, so this is the
+  # address rather than a default to fill in.
+  account: toftartifacts
+
+appStorage:
+  # Azure Files volumes provision from this class, exactly as EFS does — there
+  # is deliberately no second class variable, because a class variable per cloud
+  # is how a configuration surface becomes a matrix. Create the class with
+  # reclaimPolicy: Retain. Leave `shareName` out of its parameters and each
+  # volume is a share of its own, which a delete in Toft removes with the
+  # volume (ADR §12a); name one fixed share and a delete keeps the files and
+  # says so.
+  #
+  # **NFS 4.1 if any app will keep SQLite or DuckDB on it.** SMB does not give a
+  # single-file embedded database the locks it needs, and the corruption arrives
+  # under concurrency rather than at the first write. Toft cannot see
+  # through a mount to detect which, and does not guess.
+  efs:
+    enabled: true
+    create: false
+    name: azurefiles-toft
+  blob:
+    # The storage account `blob` object stores live in. Empty means that backing
+    # is not offered and the create form does not show it.
+    #
+    # blobfuse2 mounts read-only or read-write and has nothing between, so an
+    # app may be attached at read or full and the two middle rungs are refused
+    # at attach time. They stay available over a signed URL.
+    #
+    # The driver is an AKS addon: `az aks update --enable-blob-driver`.
+    account: toftstores
+
+# The key that encrypts the data key never leaves Key Vault.
+#
+# **The version is not optional.** A versionless identifier resolves to whatever
+# is current at call time, so rotating in the vault would silently change which
+# key wraps while every record already written still names the old one — and it
+# is refused at startup for exactly that reason. Paste the portal's Key
+# Identifier and change only the scheme.
+encryptionKeyURI: azurekeyvault://toft-kv.vault.azure.net/keys/toft/REPLACE_WITH_VERSION
+
+serviceAccount:
+  create: true
+  # Workload identity. One value, three effects: the annotation on the
+  # ServiceAccount, the label beside it, and the label on the pod template.
+  # Azure needs all three, and half of them is a pod with no projected token and
+  # a 401 on the first Blob call — which reads as an Azure permissions problem
+  # rather than a missing Kubernetes label.
+  #
+  # The federated credential is made outside the cluster, against the cluster's
+  # OIDC issuer. See docs/deploy-aks.md.
+  azureWorkloadIdentity:
+    clientId: REPLACE_WITH_MANAGED_IDENTITY_CLIENT_ID
+
+# -- Everything below is not Azure-specific -----------------------------------
+
+# The name is kept. It is in every existing .env, values.yaml and deploy
+# document, and 169.254.169.254 is Azure's IMDS as well — the CIDR list was
+# already right here. Read the note at the top of this file about the policy
+# engine before trusting it in isolated mode.
+blockAwsMetadata: true
+
+ingress:
+  enabled: true
+  className: webapprouting.kubernetes.azure.com
+  # A placeholder like every other value in this file, and the one worth
+  # replacing first: the chart refuses to render with this empty, because
+  # without it sign-in is the only control standing between this install and the
+  # internet. Put the addresses that may actually reach it here, or set
+  # allowPublicInbound=true to mean the other thing.
+  #
+  # Application routing is ingress-nginx, so the chart renders this list as
+  # nginx.ingress.kubernetes.io/whitelist-source-range on the Ingress. nginx
+  # judges the address it sees, so the controller's Service must keep the
+  # client's (externalTrafficPolicy: Local on the NginxIngressController's
+  # load balancer); otherwise every request arrives from a node and is refused.
+  inboundCidrs:
+    - 203.0.113.0/24
+  # Application routing is ingress-nginx, whose defaults refuse a body over
+  # 1 MiB and close a connection idle for 60 s. The chart renders
+  # proxy-body-size "0" and proxy-read/send-timeout "3600" on this class, so a
+  # deploy archive and a store upload get through; set a key under annotations
+  # to choose your own value.
+
+# Placeholders, like every id in this file — and nothing publishes runner
+# images, nor the platform image (ADR §111). Build them
+# from a checkout with `docker buildx bake -f docker/runner/bake.hcl`, push them
+# to your own registry (an ACR the cluster's kubelet identity can pull from),
+# and name each here with its tag. A family left empty is not offered, rather
+# than failing every deploy with an ImagePullBackOff.
+runnerImages:
+  node: REPLACE.azurecr.io/toft-runner-node:REPLACE_WITH_TAG
+  python: REPLACE.azurecr.io/toft-runner-python:REPLACE_WITH_TAG
+  go: REPLACE.azurecr.io/toft-runner-go:REPLACE_WITH_TAG
+  r: REPLACE.azurecr.io/toft-runner-r:REPLACE_WITH_TAG
+
+# Release trees and job runs on a disk of their own, apart from /data's logs and
+# build caches (values.yaml `releases`). A claim of its own on the cluster's
+# default class; `ephemeral: true` instead goes with the pod across zones and
+# restores the estate from the artifact store on every restart.
+releases:
+  enabled: true
+  size: 50Gi

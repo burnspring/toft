@@ -1,0 +1,33 @@
+apiVersion: v2
+name: toft
+description: Internal app hosting platform — clone, build, deploy and serve apps from a Git repo
+type: application
+
+# The chart version is the delivery artifact's version and moves independently
+# of the platform's. appVersion tracks the image tag this chart defaults to.
+version: 0.2.0
+appVersion: "0.10.0"
+
+home: https://gettoft.com
+sources:
+  - https://github.com/burnspring/toft
+
+keywords:
+  - paas
+  - internal-tools
+  - deployment
+
+maintainers:
+  - name: Burnspring
+
+# kubeVersion is a floor, not a pin. Nothing here uses an API newer than 1.25
+# (PodDisruptionBudget and the networking.k8s.io/v1 Ingress are the newest), and
+# a chart that refuses a customer's cluster for no reason is a support call.
+kubeVersion: ">=1.25.0-0"
+
+annotations:
+  # A customer reads this before upgrading; it is not decoration. 0.1.2 fixes a
+  # chart that rendered DEV_INSECURE_COOKIES=0 for an HTTPS install, which the
+  # platform read as ON — session cookies minted without Secure.
+  artifacthub.io/containsSecurityUpdates: "true"
+  artifacthub.io/prerelease: "true"

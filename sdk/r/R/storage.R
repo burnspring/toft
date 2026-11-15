@@ -1,0 +1,732 @@
+# Durable storage: a path where the resource is mounted, and signed URLs for a
+# store in either mode.
+#
+# An administrator maps a resource to an app, the platform mounts it where it
+# can and describes it in TOFT_STORAGE, and mounts() reads that description.
+# A store is also reached through the platform's signed URLs — store_list(),
+# store_upload(), store_download(), store_url(), store_link() and store_remove() — in both
+# execution modes, so an app written against them moves between modes
+# unchanged. On a shared host a store is never mounted: its `path` is "", and
+# those five are the whole of how the app reaches it. The same functions exist
+# in Python, Node and Go, and answer the same way.
+
+#' Every durable resource mapped to this app
+#'
+#' In the order the platform listed them, which is its `ORDER BY m.path`. That
+#' is worth knowing only because two mounts can share a name: the order is
+#' stable, and it is not a ranking. Ask for the one you mean with `folder`.
+#'
+#' Empty off-platform and empty when an administrator has mapped nothing —
+#' deliberately not an error, because "this app has no durable storage" is a
+#' normal state app code can branch on.
+#'
+#' @return A list of mounts, each a list of `name`, `kind`, `path`, `access`,
+#'   `folder`, `read_only` and `mounted`. `folder` is `""` for the whole
+#'   resource; `mounted` is FALSE for a store reached over signed URLs alone.
+#'   An entry missing its name, kind or access is refused `storage_env_invalid`.
+#' @export
+mounts <- function() {
+  raw <- trimws(Sys.getenv(ENV_STORAGE, ""))
+  if (!nzchar(raw)) {
+    return(list())
+  }
+  parsed <- tryCatch(
+    jsonlite::fromJSON(raw, simplifyVector = FALSE),
+    error = function(e) {
+      stop(toft_refusal("storage_env_invalid",
+                        sprintf("%s is not valid JSON: %s", ENV_STORAGE, conditionMessage(e)),
+                        hint = STORAGE_ENV_HINT))
+    }
+  )
+  # An object has names even when it is empty: jsonlite reads {} as a named
+  # list(), which the length test let through as no mounts (BB-110).
+  if (!is.list(parsed) || !is.null(names(parsed))) {
+    stop(toft_refusal("storage_env_invalid",
+                      sprintf("%s should be a JSON array of mounts", ENV_STORAGE),
+                      hint = STORAGE_ENV_HINT))
+  }
+  lapply(parsed, function(entry) {
+    check_mount_entry(entry)
+    path <- or_empty(entry[["path"]])
+    access <- or_empty(entry[["access"]])
+    list(
+      name = or_empty(entry[["name"]]),
+      kind = or_empty(entry[["kind"]]),
+      path = path,
+      access = access,
+      # Which directory of the resource this mount is rooted at, and "" is the
+      # whole resource. It is here because **two mounts of one resource share a
+      # name**, and the name is how app code locates a resource — so this is
+      # what tells them apart.
+      folder = or_empty(entry[["folder"]]),
+      # The two the other SDKs derive, so a mounts() entry has the documented
+      # fields in every language: read-only at `read`, and mounted where there
+      # is a path — a store reached over signed URLs alone has none.
+      read_only = identical(access, "read"),
+      mounted = nzchar(path)
+    )
+  })
+}
+
+# The local file store_put() and store_upload() read, refused coded before it
+# is opened: a path that is not there is not_found, as in Python, Node and Go
+# (BB-026); a directory, an unreadable file or something that is not one path is
+# bad_request — a directory reached readBin() as "cannot open the connection",
+# an uncoded simpleError (BB-008).
+check_local_file <- function(source, what, example) {
+  if (!is.character(source) || length(source) != 1 || is.na(source) || !nzchar(source)) {
+    stop(toft_refusal("bad_request", sprintf("%s needs the path of a local file, as one string", what),
+                      hint = paste0("pass the path of a local file: ", example)))
+  }
+  if (!file.exists(source)) {
+    stop(toft_refusal("not_found", sprintf("no such file: %s", source), hint = LOCAL_FILE_HINT))
+  }
+  if (dir.exists(source)) {
+    stop(toft_refusal("bad_request", sprintf("%s is a directory, and %s copies one file", source, what),
+                      hint = paste0("pass the path of a file, not a folder: ", example)))
+  }
+  if (file.access(source, 4) != 0) {
+    stop(toft_refusal("bad_request", sprintf("cannot read %s: permission denied", source),
+                      hint = sprintf("check that this process can read %s", source)))
+  }
+  invisible(TRUE)
+}
+
+LOCAL_FILE_HINT <- "check the path — a relative one is resolved against the working directory, getwd()"
+
+STORAGE_ENV_HINT <- paste0(
+  "TOFT_STORAGE is a JSON array of objects, each with name, kind (volume or store) and access (read, write or full), ",
+  "plus path where the resource is mounted (a store reached by signed URL has none); ",
+  "the platform writes it, and a local stand-in needs the same keys")
+
+# The platform writes every entry with a name, a kind and an access level (and
+# a path, "" for a store reached over signed URLs). An entry missing one is a
+# hand-written stand-in that would resolve to a mount with no kind — which
+# store() then takes for a store and storage() for a volume — so it is refused
+# here, as Python and Go refuse it, rather than read as empty strings.
+check_mount_entry <- function(entry) {
+  if (!is.list(entry) || is.null(names(entry))) {
+    stop(toft_refusal("storage_env_invalid",
+                      sprintf("every %s entry is a JSON object", ENV_STORAGE),
+                      hint = STORAGE_ENV_HINT))
+  }
+  for (key in c("name", "kind", "access")) {
+    value <- entry[[key]]
+    if (!is.character(value) || length(value) != 1 || is.na(value) || !nzchar(value)) {
+      stop(toft_refusal("storage_env_invalid", sprintf(
+        "a %s entry has no %s: %s", ENV_STORAGE, key,
+        as.character(jsonlite::toJSON(entry, auto_unbox = TRUE, null = "null", digits = NA))),
+        hint = STORAGE_ENV_HINT))
+    }
+  }
+  # Held to the values the platform writes: a kind it does not know is a mount
+  # store() and storage() would each guess at, and an access level it does not
+  # know makes read_only answer FALSE for a mount nothing granted write on — as
+  # Python, Node and Go refuse them.
+  for (rule in list(list("kind", STORAGE_KINDS), list("access", STORAGE_ACCESS))) {
+    key <- rule[[1]]
+    if (!entry[[key]] %in% rule[[2]]) {
+      stop(toft_refusal("storage_env_invalid", sprintf(
+        "a %s entry's %s is '%s', not one of %s: %s", ENV_STORAGE, key, entry[[key]],
+        paste(rule[[2]], collapse = ", "),
+        as.character(jsonlite::toJSON(entry, auto_unbox = TRUE, null = "null", digits = NA))),
+        hint = STORAGE_ENV_HINT))
+    }
+  }
+  invisible(TRUE)
+}
+
+STORAGE_KINDS <- c("volume", "store")
+STORAGE_ACCESS <- c("read", "write", "full")
+
+#' Where a mount is, or a refusal when it is not mounted
+#'
+#' A mount is a list, so `m$path` cannot refuse: on an install where a store is
+#' reached by signed URLs alone it is `""`, and `file.path(m$path, "x.csv")` is
+#' then `/x.csv` — a path at the root of the filesystem, which nothing refuses
+#' until a write fails or, worse, succeeds somewhere unintended. This is the
+#' spelling that refuses, `not_mounted`, naming the calls that do reach it, as
+#' `.path` does in Python and Node.
+#'
+#' @param mount A mount, as `mounts()`, `storage()` or `store()` return it.
+#' @return The mount's path.
+#' @export
+mount_path <- function(mount) {
+  if (!is.list(mount) || is.null(mount$name)) {
+    stop(toft_refusal("bad_request", sprintf(paste0(
+      "mount_path() takes a mount from storage(), store() or mounts(), got %s"),
+      if (is.null(mount)) "NULL" else class(mount)[1]),
+      hint = "mount_path(storage(\"reports\"))"))
+  }
+  if (is.null(mount$path) || !nzchar(mount$path)) {
+    stop(toft_refusal("not_mounted", sprintf(paste0(
+      "'%s' is not mounted here — on this install the app reaches it through the platform: ",
+      "use store_list(), store_upload(), store_download() or store_url()"), mount$name),
+      hint = "use store_upload(), store_download() or store_url() - this install reaches the store through the platform"))
+  }
+  mount$path
+}
+
+#' Resolve one resource by name, and — where it is mapped twice — by folder
+#'
+#' **A name is not always one mount.** A mapping's identity is
+#' `(resource, app, folder)`, so an administrator can map one resource twice:
+#' the root read-only and a folder at `write`, at two paths in one workload.
+#' Both arrive under the same name, and the folder is what tells them apart.
+#'
+#' So a name matching two mounts, with no folder named, **stops rather than
+#' picking one** — resolving it would mean choosing by the order of paths an
+#' administrator happened to pick, which is a silent answer to a question the
+#' caller did not know they were asking.
+#'
+#' @param name The name an administrator gave the resource.
+#' @param folder Which folder of it. `NULL` means do not care, which is only
+#'   ambiguous when the resource really is mapped more than once; `""` names the
+#'   root explicitly.
+#' @return One mount, as `mounts()` describes it.
+#' @export
+storage <- function(name, folder = NULL) {
+  if (missing(name)) name <- ""
+  resolve_mount(name, folder, "storage")
+}
+
+# storage()'s body, with the accessor the caller used — "storage" or "store" —
+# so a refusal names the call to make rather than the other one (drills D17:
+# store("x") was told to call storage()).
+resolve_mount <- function(name, folder, accessor) {
+  if (!is.character(name) || length(name) != 1 || is.na(name) || !nzchar(name)) {
+    stop(toft_refusal("invalid_name", paste0(accessor, "() needs the name an administrator gave the resource"),
+                      hint = "pass one of the names mounts() lists"))
+  }
+  if (!is.null(folder)) check_folder(folder, accessor)
+  available <- mounts()
+  named <- Filter(function(m) identical(m$name, name), available)
+
+  if (!is.null(folder)) {
+    exact <- Filter(function(m) identical(m$folder, folder), named)
+    if (length(exact) > 0) {
+      return(exact[[1]])
+    }
+    if (length(named) > 0) {
+      stop(toft_refusal("not_mapped", sprintf(
+        "'%s' is mounted, but not at folder '%s'. Mounted here: %s",
+        name, folder, describe_folders(named)
+      ), hint = sprintf("name a mounted folder: %s('%s', folder = '%s')", accessor, name, named[[1]]$folder)))
+    }
+  } else if (length(named) == 1) {
+    return(named[[1]])
+  } else if (length(named) > 1) {
+    stop(toft_refusal("ambiguous_mount", sprintf(
+      "%d mounts are named '%s' — %s. Name one: %s('%s', folder = '%s')",
+      length(named), name, describe_folders(named), accessor,
+      name, named[[1]]$folder
+    ), hint = sprintf("name the folder: %s('%s', folder = '%s')", accessor, name, named[[1]]$folder)))
+  }
+
+  # Only with no TOFT_STORAGE (unset or blank): "[]" is the platform saying
+  # nothing is mapped, and that is not_mapped (BB-023).
+  if (!nzchar(trimws(Sys.getenv(ENV_STORAGE, ""))) &&
+      !any(nzchar(trimws(Sys.getenv(c("TOFT_API_URL", "TOFT_APP_ID", "TOFT_RUN_ID", "TOFT_SCRATCH_DIR")))))) {
+    # Off the platform there is nothing to map, and "ask an administrator"
+    # would send somebody to one over a laptop — the code the others raise.
+    stop(toft_refusal("off_platform", sprintf(paste0(
+      "%s('%s') needs the storage Toft maps into a deployed app (TOFT_STORAGE) — ",
+      "it only resolves in an app running on the platform"), accessor, name),
+      hint = "set TOFT_STORAGE to a JSON array of mounts to stand one in locally"))
+  }
+  if (length(available) == 0) {
+    stop(toft_refusal("not_mapped", sprintf(
+      paste0("no storage resource named '%s', and this app has none mapped at all — ",
+             "an administrator maps storage on the app's Storage tab"), name),
+      hint = "ask an administrator to map storage on the app's Storage tab"))
+  }
+  # Each name once: a resource mapped at two folders is one resource.
+  names <- paste(sort(unique(vapply(available, function(m) m$name, ""))), collapse = ", ")
+  stop(toft_refusal("not_mapped", sprintf(
+    "no storage resource named '%s'. Mapped to this app: %s", name, names
+  ), hint = paste0("use one of the names mapped to this app: ", names)))
+}
+
+#' Resolve one store by name
+#'
+#' A kind-checked alias of [storage()]. Uploads are a store feature end to end —
+#' the CLI command is `toft store`, the grant table refuses a volume — so a reader
+#' never has to remember which kinds are in scope, because the name is the kind.
+#'
+#' Write to it with [store_put()] rather than `file.copy()`. A store is not an
+#' ordinary directory, and this documentation used to say it was: see
+#' [store_put()].
+#'
+#' @param name The name an administrator gave the store.
+#' @param folder Which folder of it, as in [storage()].
+#' @return One mount.
+#' @export
+store <- function(name, folder = NULL) {
+  if (missing(name)) name <- ""
+  mount <- resolve_mount(name, folder, "store")
+  if (nzchar(mount$kind) && !identical(mount$kind, "store")) {
+    stop(toft_refusal("not_a_store", sprintf(
+      paste0("'%s' is a %s, not a store. A volume is a real filesystem — write to ",
+             "storage('%s')$path directly, with the ordinary file functions."),
+      name, mount$kind, name
+    ), hint = sprintf("use storage('%s')$path with the ordinary file functions", name)))
+  }
+  mount
+}
+
+#' Copy a local file into a store
+#'
+#' The same route the other three SDKs give an app. It is a function rather than
+#' a method only because R has no object to hang one on.
+#'
+#' **`file.copy()` is the obvious call and it does not work.** On a Mountpoint
+#' store it creates the object and leaves it **empty**, returning `FALSE` rather
+#' than raising — so the failure is visible only to code that checks a return
+#' value most R ignores. An app archiving a report every night fills a bucket
+#' with correctly named, zero-byte files, and the first person to notice is
+#' whoever opens one. What defeats it is that a store is not a filesystem: there
+#' is no rename and no random write, and base R's file helpers were written
+#' against one that has both.
+#'
+#' So this streams the bytes sequentially, which is the shape a store supports,
+#' in chunks so that a file larger than memory is not a separate problem.
+#'
+#' Like the other three, it is sugar over the mounted path and calls nothing.
+#' Where the store is not mounted — on an install with no cluster — it refuses,
+#' and [store_upload()] reaches the store through the platform instead.
+#'
+#' The access level is checked here only for a better message. **The mount is
+#' the enforcement** — Mountpoint refuses an operation the grant does not carry.
+#'
+#' @param mount A store, as [store()] returns it, or its name — an unmapped
+#'   name is refused `not_mapped`, as [store()] refuses it.
+#' @param source Path to the local file to copy.
+#' @param name What to call it in the store, relative to the mount. Defaults to
+#'   the source file's own name; a leading slash, a backslash or a `..` segment
+#'   is refused, because the name is the caller's and the location is not.
+#' @return The path it was written to, invisibly.
+#' @export
+store_put <- function(mount, source, name = NULL) {
+  # A name resolves with storage(), not store(): a copy onto the mount is a
+  # mounted volume's as much as a mounted store's — as put() is in Python and
+  # Node, and Go's Mount.Put (BB-010). The signed-URL store_*() stay a store's.
+  if (missing(mount)) no_store("store_put()")
+  if (is.character(mount) && length(mount) == 1 && !is.na(mount)) mount <- storage(mount)
+  mount <- as_store(mount, "store_put()")
+  # "" is the working directory, and copying there writes into the app's own
+  # tree: a store that is not mounted is reached through the platform instead.
+  if (is.null(mount$path) || !nzchar(mount$path)) {
+    stop(toft_refusal("not_mounted", sprintf(paste0("'%s' is not mounted here, so store_put() has nowhere to copy to — ",
+                        "use store_upload(), which reaches it through the platform"),
+                 mount$name),
+      hint = "use store_upload(), which reaches the store through the platform"))
+  }
+  if (missing(source)) source <- ""
+  check_local_file(source, "store_put()", "store_put(s, \"report.csv\")")
+  target <- if (is.null(name)) basename(source) else name
+  check_relative_name(target, "store_put")
+
+  if (identical(mount$access, "read")) {
+    stop(toft_refusal("insufficient_access", sprintf(
+      paste0("'%s' is mounted read-only, so this app cannot write to it. An administrator ",
+             "sets the access level where the resource is mapped."), mount$name),
+      hint = "ask an administrator for `write` access where the resource is mapped"))
+  }
+
+  destination <- file.path(mount$path, target)
+  dir.create(dirname(destination), recursive = TRUE, showWarnings = FALSE)
+
+  input <- file(source, "rb")
+  on.exit(close(input), add = TRUE)
+  output <- file(destination, "wb")
+  on.exit(close(output), add = TRUE)
+  repeat {
+    chunk <- readBin(input, "raw", n = 1048576L)
+    if (length(chunk) == 0) {
+      break
+    }
+    writeBin(chunk, output)
+  }
+  invisible(destination)
+}
+
+#' List one page of a store, over the platform's signed URLs
+#'
+#' @param mount A store, as [store()] returns it, or its name — an unmapped
+#'   name is refused `not_mapped`, as [store()] refuses it.
+#' @param path A folder under the mount, `""` for its top.
+#' @param cursor `next_cursor` from the previous page, `""` for the first.
+#' @return A list of `objects`, `prefixes`, `next_cursor` and `access`. Names
+#'   are relative to `path`.
+#' @export
+store_list <- function(mount, path = "", cursor = "") {
+  mount <- as_store(mount, "store_list()")
+  if (!is.character(path) || length(path) != 1 || is.na(path)) check_relative_name(path, "store_list")
+  if (nzchar(path)) check_relative_name(sub("/$", "", path), "store_list")
+  page <- store_request("GET", store_route(mount, "/api/v1/app/store/{slug}/objects"),
+                        query = store_query(mount, list(path = path, cursor = cursor)))
+  list(
+    objects = if (is.null(page$objects)) list() else page$objects,
+    prefixes = if (is.null(page$prefixes)) list() else page$prefixes,
+    next_cursor = or_empty(page$next_cursor),
+    access = or_empty(page$access)
+  )
+}
+
+#' Upload a local file to a store, over the platform's signed URLs
+#'
+#' At `write` this creates new objects only, and an existing name is a refusal
+#' that says so; `full` replaces. The bytes go straight to the
+#' object store — the platform signs, and never sees them.
+#'
+#' @param mount A store, as [store()] returns it, or its name — an unmapped
+#'   name is refused `not_mapped`, as [store()] refuses it.
+#' @param source Path to the local file.
+#' @param name What to call it, relative to the mount. Defaults to its own name.
+#' @return The name it landed under, invisibly.
+#' @export
+store_upload <- function(mount, source, name = NULL) {
+  mount <- as_store(mount, "store_upload()")
+  if (missing(source)) source <- ""
+  check_local_file(source, "store_upload()", "store_upload(s, \"report.csv\")")
+  target <- if (is.null(name) || identical(name, "")) basename(source) else name
+  check_relative_name(target, "store_upload")
+  # Streamed, never held: hashed from a connection and sent through curl's
+  # read callback with the length declared. One readBin of the whole file held
+  # it in memory twice over — an app under a memory limit could not upload
+  # anything larger than that limit, and a raw vector past 2^31-1 bytes is a
+  # long vector curl's postfields was never shown to take (security review
+  # 2026-11-14, CS-11 and CS-U1).
+  size <- file.info(source)$size
+  signed <- store_request("POST", store_route(mount, "/api/v1/app/store/{slug}/objects"),
+                         body = list(name = target, size = size,
+                                     # paste0: a plain string, not the "hash"
+                                     # class jsonlite has no method for.
+                                     sha256 = file_digest(source, openssl::sha256),
+                                     md5 = file_digest(source, openssl::md5)),
+                         query = store_query(mount))
+  status <- send_signed(signed, NULL, upload = list(path = source, size = size))
+  # The status the store answers an existing name with is the signer's to say:
+  # 412 where If-None-Match is signed, 403 on an Azure create-only SAS (code
+  # review 2026-11-11, I-5); 412 when an older install says nothing.
+  exists_status <- if (is.null(signed$exists_status)) 412L else as.integer(signed$exists_status)
+  if (status == exists_status) {
+    # `write`, not mount$access: the store signs at the mapping's level now,
+    # and only `write` is refused an existing name.
+    e <- toft_refusal("already_exists", sprintf("'%s' already exists in '%s', and this app's access there is `write`, which creates new objects only",
+                 target, mount$name),
+      hint = "upload under a new name, or ask an administrator for `full` access where the store is mapped")
+    # The store answered, so the status is its own, as not_found's is.
+    e$status <- as.integer(status)
+    stop(e)
+  }
+  check_signed_status(status)
+  invisible(target)
+}
+
+#' Download one object from a store
+#'
+#' @param mount A store, as [store()] returns it, or its name — an unmapped
+#'   name is refused `not_mapped`, as [store()] refuses it.
+#' @param name The object, relative to the mount.
+#' @param dest Where to write it. `NULL` returns the bytes as a raw vector.
+#' @return The raw bytes, or `dest` invisibly.
+#' @export
+store_download <- function(mount, name, dest = NULL) {
+  mount <- as_store(mount, "store_download()")
+  signed <- sign_get(mount, name, FALSE, "store_download")
+  got <- send_signed(signed, NULL, keep = TRUE)
+  if (got$status == 404) {
+    # The URL is signed for any name; the store is what answers that nothing
+    # is there — the first night of every nightly job.
+    e <- toft_refusal("not_found", sprintf("'%s' is not in '%s' — nothing has been put there under that name yet",
+                                           name, mount$name),
+                      hint = "store_list() shows the names that are there")
+    e$status <- 404L
+    stop(e)
+  }
+  check_signed_status(got$status)
+  if (is.null(dest)) {
+    return(got$content)
+  }
+  dir.create(dirname(dest), recursive = TRUE, showWarnings = FALSE)
+  writeBin(got$content, dest)
+  invisible(dest)
+}
+
+#' A signed link to one object, to hand to a browser
+#'
+#' It lives fifteen minutes, and anyone holding it reads that object until then
+#' — the point for a download link, and the reason not to log one.
+#'
+#' @param mount A store, as [store()] returns it, or its name — an unmapped
+#'   name is refused `not_mapped`, as [store()] refuses it.
+#' @param name The object, relative to the mount.
+#' @param attachment `TRUE` makes a browser save it under the object's own name.
+#' @return The URL.
+#' @export
+store_url <- function(mount, name, attachment = FALSE) {
+  mount <- as_store(mount, "store_url()")
+  sign_get(mount, name, attachment, "store_url")$url
+}
+
+#' A lasting link to one file, for a message somebody opens later
+#'
+#' **Only people granted this storage can open it.** Grant the recipients the
+#' store (Admin → Storage → its page lists who holds it), or send them something
+#' else: anyone else who opens the link gets "Not found".
+#'
+#' Unlike [store_url()] it carries no credential and does not expire: it is the
+#' platform's address plus the store and the name, and opening it signs the
+#' reader in and checks their grant at that moment. It opens whatever is at the
+#' name then — write a dated name, never a fixed one, if a mailed link must keep
+#' meaning the mailed file. The file need not exist yet. Works on a store and on
+#' a volume on a host root ([storage()]), in a job too.
+#'
+#' @param mount A store or volume, as [store()] or [storage()] returns it, or a
+#'   store's name.
+#' @param name The file, relative to the mount.
+#' @return The link.
+#' @export
+store_link <- function(mount, name) {
+  mount <- as_store(mount, "store_link()")
+  check_relative_name(name, "store_link")
+  route <- sub("{slug}", url_escape(mount$name),
+               "/api/v1/app/store/{slug}/link/{name}", fixed = TRUE)
+  route <- sub("{name}", encode_name(name), route, fixed = TRUE)
+  answer <- store_request("GET", route, query = store_query(mount))
+  answer$link
+}
+
+#' Delete one object from a store. Needs `full`.
+#'
+#' @param mount A store, as [store()] returns it, or its name — an unmapped
+#'   name is refused `not_mapped`, as [store()] refuses it.
+#' @param name The object, relative to the mount.
+#' @export
+store_remove <- function(mount, name) {
+  mount <- as_store(mount, "store_remove()")
+  check_relative_name(name, "store_remove")
+  signed <- store_request("DELETE", store_route(mount, "/api/v1/app/store/{slug}/objects/{name}", name),
+                         query = store_query(mount))
+  check_signed_status(send_signed(signed, NULL))
+  invisible(NULL)
+}
+
+sign_get <- function(mount, name, attachment, call) {
+  check_relative_name(name, call)
+  extra <- if (isTRUE(attachment)) list(disposition = "attachment") else list()
+  store_request("GET", store_route(mount, "/api/v1/app/store/{slug}/objects/{name}", name),
+                query = store_query(mount, extra))
+}
+
+# as_store is the mount every store_*() function works on. A name is resolved
+# with store(), so store_upload("nope", ...) answers not_mapped exactly as
+# store("nope") does; a mount that names no resource is not_mapped too. Before
+# this, a name reached `mount$name` on a character vector — a raw R error — and
+# only store() itself said not_mapped.
+as_store <- function(mount, what) {
+  # missing() follows the promise, so store_list() with no arguments lands
+  # here: it was R's own "argument "mount" is missing" (BB-005).
+  if (missing(mount)) no_store(what)
+  if (is.character(mount) && length(mount) == 1 && !is.na(mount)) {
+    return(store(mount))
+  }
+  if (!is.list(mount)) {
+    stop(toft_refusal("bad_request", sprintf("%s needs a store, as store() returns it, or its name", what),
+                      hint = "pass store(\"name\"), or the name itself, as the first argument"))
+  }
+  if (is.null(mount$name) || !nzchar(or_empty(mount$name))) {
+    stop(toft_refusal("not_mapped", sprintf("%s was given a mount that names no storage resource", what),
+                      hint = "resolve the store with store(name) first"))
+  }
+  mount
+}
+
+no_store <- function(what) {
+  stop(toft_refusal("bad_request", sprintf("%s needs a store, as store() returns it, or its name, and was given none", what),
+                    hint = "pass store(\"name\"), or the name itself, as the first argument"))
+}
+
+# store_request is toft_request for the store routes, with the platform's
+# store_not_mapped reported as not_mapped — the code store() raises for the same
+# fact, so an app branches on one code whichever side noticed. The platform's
+# own code stays in e$body$code.
+store_request <- function(...) {
+  tryCatch(toft_request(...), toft_error = function(e) {
+    if (identical(e$code, "store_not_mapped")) {
+      e$code <- "not_mapped"
+    }
+    stop(e)
+  })
+}
+
+# `route` is the platform's route, spelled whole so a reader — and the SDK
+# contract test — sees which one each call reaches.
+store_route <- function(mount, route, name = "") {
+  mount <- as_store(mount, "this")
+  if (nzchar(or_empty(mount$kind)) && !identical(mount$kind, "store")) {
+    stop(toft_refusal("not_a_store", sprintf(paste0("'%s' is a %s, which is reached at its path — only an object store ",
+                        "is reached over signed URLs"), mount$name, mount$kind),
+      hint = sprintf("use storage('%s')$path with the ordinary file functions", mount$name)))
+  }
+  route <- sub("{slug}", url_escape(mount$name), route, fixed = TRUE)
+  sub("{name}", encode_name(name), route, fixed = TRUE)
+}
+
+# The folder always travels, "" included: it names *this* mapping, so a
+# resource mapped twice is never a question the platform has to ask back.
+store_query <- function(mount, extra = list()) {
+  query <- list(folder = or_empty(mount$folder))
+  for (k in names(extra)) {
+    if (nzchar(extra[[k]])) query[[k]] <- extra[[k]]
+  }
+  query
+}
+
+encode_name <- function(name) {
+  parts <- strsplit(name, "/", fixed = TRUE)[[1]]
+  paste(vapply(parts, url_escape, ""), collapse = "/")
+}
+
+# A file's digest, read from a connection rather than from a vector holding
+# the whole file (store_upload).
+file_digest <- function(path, algo) {
+  con <- file(path, "rb")
+  on.exit(close(con))
+  paste0(as.character(algo(con)), collapse = "")
+}
+
+# Carry out a signed request against the object store: the signed headers
+# verbatim, and no Toft header at all — the URL is the whole authorization.
+# `upload`, list(path, size), sends that file as the body through curl's read
+# callback with its length declared — never chunked, because the signed PUT
+# carries the size, and never more than `size` bytes.
+send_signed <- function(signed, data, keep = FALSE, upload = NULL) {
+  if (is.null(signed) || is.null(signed$url) || !nzchar(signed$url)) {
+    # Not the caller's mistake: an answer the platform should not have given.
+    # Uncoded and retryable, as the other three SDKs' statusless error is.
+    stop(toft_refusal("", "the platform returned no signed URL", retryable = TRUE))
+  }
+  handle <- store_handle()
+  method <- if (is.null(signed$method) || !nzchar(signed$method)) "GET" else signed$method
+  curl::handle_setopt(handle, customrequest = method)
+  if (!is.null(data)) {
+    curl::handle_setopt(handle, post = TRUE, postfieldsize = length(data), postfields = data)
+  }
+  if (!is.null(upload)) {
+    con <- file(upload$path, "rb")
+    on.exit(close(con), add = TRUE)
+    left <- upload$size
+    curl::handle_setopt(handle, upload = TRUE, infilesize_large = upload$size,
+      readfunction = function(n) {
+        if (left <= 0) return(raw(0))
+        chunk <- readBin(con, "raw", n = min(n, left))
+        left <<- left - length(chunk)
+        chunk
+      })
+  }
+  headers <- signed$headers
+  if (length(headers)) {
+    curl::handle_setheaders(handle, .list = lapply(headers, as.character))
+  }
+  resp <- fetch(signed$url, handle, "cannot reach the object store")
+  if (keep) list(status = resp$status_code, content = resp$content) else resp$status_code
+}
+
+check_signed_status <- function(status) {
+  if (status >= 400) {
+    # A toft_error like every other refusal, so tryCatch(toft_error = ) sees
+    # it. No body to say otherwise, so the status decides: a throttle or a
+    # server error may pass, anything else is the request itself.
+    stop(store_refusal("store_refused",
+      sprintf("the object store refused the request (%d)", status), status))
+  }
+  invisible(TRUE)
+}
+
+# A name that would land outside the mount is refused, on the discipline the
+# platform applies to an uploaded object's name and for the same reason: the
+# name is the caller's and the location is not, so a traversal segment would
+# write into the app's own filesystem — over its code, in the worst case —
+# rather than into the storage it was given.
+NAME_HINT <- "use a relative name with forward slashes and no '.' or '..' segments"
+
+# The example each call's not-a-string refusal names, so the hint is the call
+# that was made — store_download(s, 5) was told to call store_upload() (BB-109's sweep).
+NAME_EXAMPLE <- c(
+  store_upload = "store_upload(s, \"local.csv\", \"reports/2026-08.csv\")",
+  store_put = "store_put(s, \"local.csv\", \"reports/2026-08.csv\")",
+  store_download = "store_download(s, \"reports/2026-08.csv\")",
+  store_url = "store_url(s, \"reports/2026-08.csv\")",
+  store_link = "store_link(s, \"reports/2026-08.csv\")",
+  store_remove = "store_remove(s, \"reports/2026-08.csv\")",
+  store_list = "store_list(s, \"reports/\")"
+)
+
+check_relative_name <- function(name, call) {
+  if (missing(name)) {
+    stop(toft_refusal("bad_request", sprintf("%s() needs an object name, and was given none", call),
+                      hint = paste0("pass the name as a string: ", NAME_EXAMPLE[[call]])))
+  }
+  # One string: a number reached startsWith() as an uncoded error (BB-008's sweep).
+  if (!is.character(name) || length(name) != 1 || is.na(name)) {
+    stop(toft_refusal("bad_request", sprintf("%s()'s object name is one string, got %s", call,
+                                             paste(deparse(name), collapse = "")),
+                      hint = paste0("pass the name as a string: ", NAME_EXAMPLE[[call]])))
+  }
+  if (!nzchar(name)) {
+    stop(toft_refusal("invalid_name", "a name is required", hint = NAME_HINT))
+  }
+  if (startsWith(name, "/") || endsWith(name, "/")) {
+    stop(toft_refusal("invalid_name", sprintf("a name is relative to the mount, got '%s'", name), hint = NAME_HINT))
+  }
+  if (grepl("\\", name, fixed = TRUE)) {
+    stop(toft_refusal("invalid_name", sprintf("a name must use forward slashes, got '%s'", name), hint = NAME_HINT))
+  }
+  for (segment in strsplit(name, "/", fixed = TRUE)[[1]]) {
+    if (!nzchar(segment) || identical(segment, ".") || identical(segment, "..")) {
+      stop(toft_refusal("invalid_name", sprintf("a name must not contain '%s' segments, got '%s'", segment, name), hint = NAME_HINT))
+    }
+  }
+  invisible(TRUE)
+}
+
+# A folder names a directory inside the resource, so it is held to the rule an
+# object's name is: relative, forward slashes, no '.' or '..' segments. ""
+# names the root. Without this, storage("x", "..") was not_mapped — "mounted,
+# but not at folder '..'" — a lookup failing where the argument was the fault.
+check_folder <- function(folder, accessor) {
+  hint <- sprintf("name a folder of the resource, like %s('drop', folder = 'backup'), or '' for its root", accessor)
+  if (!is.character(folder) || length(folder) != 1 || is.na(folder)) {
+    stop(toft_refusal("invalid_name", sprintf(
+      "%s()'s folder is one string, got %s", accessor, deparse(folder)), hint = hint))
+  }
+  if (!nzchar(folder)) return(invisible(TRUE))
+  bad <- startsWith(folder, "/") || endsWith(folder, "/") || grepl("\\", folder, fixed = TRUE) ||
+    any(strsplit(folder, "/", fixed = TRUE)[[1]] %in% c("", ".", ".."))
+  if (bad) {
+    stop(toft_refusal("invalid_name", sprintf(
+      "a folder is a relative path inside the resource, with forward slashes and no '.' or '..' segments, got '%s'",
+      folder), hint = hint))
+  }
+  invisible(TRUE)
+}
+
+# A missing key is "", not NULL: an install older than a field says nothing, and
+# every caller here wants a string. `%||%` is base R only from 4.4 and this
+# package runs on 4.3.
+or_empty <- function(value) {
+  if (is.null(value)) "" else as.character(value)
+}
+
+# The folders one name is mounted at, with the level of each.
+#
+# The level is in the message because it is usually the reason there are two: a
+# read corpus and a write drop are the shape this feature exists for, and a
+# caller who picked the wrong one wants to see that immediately.
+describe_folders <- function(named) {
+  paste(vapply(named, function(m) {
+    sprintf("folder '%s' at %s", m$folder, if (nzchar(m$access)) m$access else "read")
+  }, ""), collapse = ", ")
+}

@@ -1,0 +1,66 @@
+{{- if and .Values.appStorage.efs.enabled .Values.appStorage.efs.create }}
+{{/*
+The StorageClass Toft provisions app *volumes* from. Every line is
+load-bearing:
+
+  provisioningMode: efs-ap        One access point per claim. The access point's
+                                  root-directory jail IS the isolation between
+                                  apps — every workload runs as the same UID, so
+                                  filesystem modes cannot tell one app from
+                                  another. A plain EFS mount shared by every app
+                                  has no jail and no containment.
+
+  ensureUniqueDirectory: "false"  With subPathPattern set to the claim name,
+                                  this gives human-readable directories on the
+                                  drive. Toft controls claim names, so the
+                                  resource slug makes them unique among live
+                                  resources — and opaque GUIDs are a standing
+                                  operational cost the first time an
+                                  administrator inspects a volume by hand. A
+                                  *deleted* volume whose files were kept still
+                                  owns /lpv-<slug>, so the platform holds that
+                                  name (storage_deletions.kept) until an
+                                  administrator releases it; a new volume of
+                                  the name would otherwise be handed the old
+                                  files. Never flip this to "true": class
+                                  parameters are immutable, so helm upgrade
+                                  would fail on every existing install.
+
+reclaimPolicy is the one value here, and the default is Retain. Under Delete,
+removing a claim destroys the access point and everything in it; deleting a
+storage resource in Toft releases the binding and the data survives for
+deliberate cleanup.
+
+An ephemeral cluster inverts that reasoning: there, Retain is precisely what
+strands access points on a filesystem the teardown then cannot delete. Setting
+Delete is a deliberate, install-specific decision and belongs in that install's
+values file with a comment, not in the default.
+*/}}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.appStorage.efs.name }}
+  labels:
+    {{- include "toft.labels" . | nindent 4 }}
+  {{- if .Values.appStorage.efs.deleteRemovesData }}
+  # The operator's word that the EFS CSI controller runs
+  # deleteAccessPointRootDir at v3.4.1 or later, so deleting a volume in Toft
+  # removes its directory (values.yaml, appStorage.efs.deleteRemovesData).
+  annotations:
+    toft.dev/delete-removes-data: "true"
+  {{- end }}
+provisioner: efs.csi.aws.com
+reclaimPolicy: {{ .Values.appStorage.efs.reclaimPolicy }}
+volumeBindingMode: Immediate
+parameters:
+  provisioningMode: efs-ap
+  fileSystemId: {{ .Values.appStorage.efs.fileSystemId }}
+  directoryPerms: "700"
+  # The workload's UID (internal/kube.runnerUID). A workload cannot chown what
+  # it mounts, so the access point has to be owned by the account the runner
+  # image runs as.
+  uid: {{ .Values.appStorage.efs.uid | quote }}
+  gid: {{ .Values.appStorage.efs.gid | quote }}
+  subPathPattern: "${.PVC.name}"
+  ensureUniqueDirectory: "false"
+{{- end }}

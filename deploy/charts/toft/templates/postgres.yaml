@@ -1,0 +1,145 @@
+{{- if .Values.postgres.enabled }}
+{{/*
+An in-cluster Postgres: single replica, one claim, no backups, no replication,
+no failover. This is a *fixture* — it makes a fresh cluster work with one
+command, and it is the right answer for a test install whose whole point is
+being thrown away.
+
+It is not the right answer for anything holding real data. That install sets
+postgres.enabled=false and points secrets.existingSecret at a DATABASE_URL for a
+managed database. The chart does not pretend otherwise, and this comment is here
+so nobody has to discover the distinction during an incident.
+*/}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "toft.postgresName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "toft.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- if .Values.postgres.persistence.storageClass }}
+  storageClassName: {{ .Values.postgres.persistence.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.postgres.persistence.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "toft.postgresName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "toft.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: {{ include "toft.postgresName" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "toft.postgresName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "toft.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    # Same reasoning as the platform: one replica on a ReadWriteOnce claim, so a
+    # rolling update deadlocks waiting for a volume the old pod still holds.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "toft.postgresName" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "toft.postgresName" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      containers:
+        - name: postgres
+          image: "{{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }}"
+          imagePullPolicy: {{ .Values.postgres.image.pullPolicy }}
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: {{ .Values.postgres.database | quote }}
+            - name: POSTGRES_USER
+              value: {{ .Values.postgres.username | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "toft.secretName" . }}
+                  key: POSTGRES_PASSWORD
+            # The image initialises into $PGDATA, and a mounted volume's
+            # lost+found makes an ext4 root look non-empty to initdb. A
+            # subdirectory is the standard way around it.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: [pg_isready, -U, {{ .Values.postgres.username | quote }}, -d, {{ .Values.postgres.database | quote }}]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: [pg_isready, -U, {{ .Values.postgres.username | quote }}, -d, {{ .Values.postgres.database | quote }}]
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.postgres.resources | nindent 12 }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "toft.postgresName" . }}
+---
+{{/*
+Only the platform may reach its database. An isolated app's egress is open to
+everything but the metadata addresses, and the release namespace has no ingress
+policy of its own — so without this an app can hold every connection slot
+(max_connections 100, authentication_timeout 60s) against a Service name it can
+predict from the release, and the platform cannot connect.
+
+The selector is the compiled-in platform label (toft.workloadLabel), so it
+needs no knob. The managed-database path (postgres.enabled=false) owes the same
+rule at the database's own firewall: admit the platform's nodes or pod subnet,
+not the cluster's. kubectl port-forward and exec arrive inside the pod and are
+not affected.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "toft.postgresName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "toft.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "toft.postgresName" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "toft.selectorLabels" . | nindent 14 }}
+      ports:
+        - port: 5432
+          protocol: TCP
+{{- end }}

@@ -1,0 +1,121 @@
+# What Toft injects, and what to do when it has not.
+#
+# Anything that talks to the platform stops with an error naming the variable
+# that is missing. It does not quietly become a no-op, and there is deliberately
+# no dry-run mode: an SDK that prints to a console instead of paging a channel
+# is a trap that only springs in production, and it springs at 2am on the one
+# night somebody needed the page. Develop against a real install.
+#
+# The single exception is scratch_dir(), which is pure filesystem and falls back
+# to the session temp directory — a path is a path.
+
+ENV_APP_TOKEN <- "TOFT_APP_TOKEN"
+ENV_API_URL <- "TOFT_API_URL"
+ENV_APP_ID <- "TOFT_APP_ID"
+ENV_APP_SLUG <- "TOFT_APP_SLUG"
+ENV_STORAGE <- "TOFT_STORAGE"
+ENV_SCRATCH_DIR <- "TOFT_SCRATCH_DIR"
+ENV_BASE_PATH <- "BASE_PATH"
+
+# Not read for their values, only to tell one absence from another: inside a job
+# the app token is *meant* to be missing, and the run id is exactly the
+# condition "we are inside a job".
+ENV_RUN_ID <- "TOFT_RUN_ID"
+ENV_JOB_NAME <- "TOFT_JOB_NAME"
+ENV_SCHEDULED_FOR <- "TOFT_SCHEDULED_FOR"
+
+# What else the runner exports to a job, read by current_run().
+ENV_JOB_TOKEN <- "TOFT_JOB_TOKEN"
+ENV_PARAMS <- "TOFT_PARAMS"
+ENV_RERUN_OF <- "TOFT_RERUN_OF"
+ENV_DEADLINE <- "TOFT_DEADLINE"
+ENV_OUTPUT_URI <- "TOFT_OUTPUT_URI"
+ENV_TRIGGER <- "TOFT_TRIGGER"
+ENV_TRIGGER_ROLE <- "TOFT_TRIGGER_ROLE"
+
+# The runner callback contract a job's run_progress() speaks, and it must equal
+# the platform's runner.ContractVersion: the platform reports a skew as a 409
+# rather than tolerating it. The same literal the other three SDKs carry.
+RUNNER_CONTRACT_VERSION <- "2"
+RUNNER_VERSION_HEADER <- "X-Toft-Runner-Version"
+
+# The app contract version this SDK speaks, sent on every /api/v1/app/* call.
+# The platform refuses a mismatch rather than tolerating it, so a partial
+# upgrade fails loudly instead of half-working in a way nobody traces back to a
+# version skew.
+APP_CONTRACT_VERSION <- "1"
+CONTRACT_HEADER <- "X-Toft-App-Contract"
+
+# Who a call is on behalf of. The same name the other three SDKs export, and the
+# only channel the platform reads it from — it is a signed assertion the app
+# relays and can neither mint nor alter, which is why it travels as a header
+# rather than as something the app composes into a body.
+ACT_FOR_HEADER <- "X-Toft-Act-For"
+
+# require_env reads an injected variable, or stops saying what sets it. The
+# message names the variable rather than describing the situation, because the
+# fix is always the same: run this on Toft - except in the one case where
+# it is not, which missing_env() explains.
+require_env <- function(name) {
+  value <- trimws(Sys.getenv(name, ""))
+  if (nzchar(value)) {
+    return(value)
+  }
+  code <- if (identical(name, ENV_APP_TOKEN) && nzchar(trimws(Sys.getenv(ENV_RUN_ID, "")))) {
+    "job_send_only"
+  } else {
+    "off_platform"
+  }
+  stop(toft_refusal(code, missing_env(name), hint = missing_env_hint(name)))
+}
+
+# missing_env_hint is the next step, as Node, Python and Go give it (BB-068):
+# inside a job, move the call; anywhere else, run on Toft or stand it in.
+missing_env_hint <- function(name) {
+  if (nzchar(trimws(Sys.getenv(ENV_RUN_ID, "")))) {
+    if (identical(name, ENV_APP_TOKEN)) {
+      return("do this from the service process, or write the result with run_write_output() and let an endpoint read it")
+    }
+    return(sprintf("%s belongs to the service process, not a job - read it there, or pass it to the job as a param", name))
+  }
+  sprintf("run this in an app deployed on Toft; to try it locally, set %s yourself", name)
+}
+
+# missing_env is why the variable is absent, in the two cases that differ.
+#
+# **The app token missing inside a job is not a broken deploy.** A job workload
+# is given none, deliberately: the app's credential belongs to the process
+# serving its requests, and a job serves none. The generic sentence is actively
+# misleading there - it tells an author running a deployed app on the platform
+# that they are not running on the platform, and sends them looking for a
+# missing variable, a broken deploy or a platform bug. The answer is
+# architectural, so it has to be in the sentence.
+#
+# TOFT_RUN_ID is what says we are inside a job; the runner exports it for
+# every run and for nothing else. Same branch, same wording, in all four SDKs:
+# the way round it is the run's output, run_write_output(), or one of its
+# mounts.
+missing_env <- function(name) {
+  run_id <- trimws(Sys.getenv(ENV_RUN_ID, ""))
+  if (identical(name, ENV_APP_TOKEN) && nzchar(run_id)) {
+    job <- trimws(Sys.getenv(ENV_JOB_NAME, ""))
+    where <- if (nzchar(job)) sprintf("job '%s', run %s", job, run_id) else paste("run", run_id)
+    return(sprintf(
+      paste0(
+        "%s is not set because this is a job (%s), and a job is deliberately given ",
+        "no app token - this is not a broken deploy. app_data_get() and app_info() ",
+        "belong to the process serving this app's requests, and a job serves none. ",
+        "Two ways round it: do this from the service process, or carry the result ",
+        "out of the run with run_write_output() and let an endpoint fold it in."
+      ),
+      name, where
+    ))
+  }
+  sprintf(
+    paste0(
+      "%s is not set. This call needs the environment Toft injects into a ",
+      "deployed app - it only works in an app running on the platform."
+    ),
+    name
+  )
+}

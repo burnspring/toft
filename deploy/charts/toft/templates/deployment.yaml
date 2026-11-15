@@ -1,0 +1,231 @@
+{{- $twoOrigin := eq (include "toft.singleOrigin" .) "false" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "toft.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "toft.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    # One instance, permanently in the data path, holding a ReadWriteOnce claim.
+    # A rolling update would deadlock on the claim and double-run the build queue
+    # besides. The platform drains rather than closing, so a Recreate is a pause
+    # and not an outage.
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "toft.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{/*
+        Kubernetes does not restart anything when a ConfigMap or Secret consumed
+        through envFrom changes — environment variables are read once, at process
+        start. Without these, `helm upgrade` writes a new BASE_URL, reports
+        success, and leaves the platform serving the old one. It is the change
+        that *looks* like it worked, which is the worst kind.
+        */}}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if not .Values.secrets.existingSecret }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- /*
+        toft.labels carries `app.kubernetes.io/name: toft`, which is
+        compiled into the binary — every isolated workload's NetworkPolicy
+        admits ingress from it. Everything below ADDS to that and none of it may
+        replace it.
+        */ -}}
+        {{- include "toft.labels" . | nindent 8 }}
+        {{- /* The pod half of the pair on the ServiceAccount. Azure's webhook reads this
+             label to decide whether to project a token at all, so it comes from the same
+             value rather than from podLabels below — which is what makes it impossible to
+             set one and forget the other. */ -}}
+        {{- if .Values.serviceAccount.azureWorkloadIdentity.clientId }}
+        azure.workload.identity/use: "true"
+        {{- end }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "toft.serviceAccountName" . }}
+      {{- /*
+      The token is mounted by hand (volume sa-token below) rather than
+      automounted, so that its mode is written here: 0600, owned by root. Shared
+      apps run inside this pod as their own uids, and the token is the
+      platform's — the right to create pods in the apps namespace and PVs
+      cluster-wide. An automounted token is 0644 unless the kubelet happens to
+      find an effective fsUser, which this pod has only because runAsUser: 0 is
+      spelled out; a sidecar with another uid, or that line removed, would hand
+      every shared app the platform's cluster identity with nothing failing.
+      */}}
+      automountServiceAccountToken: false
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      containers:
+        - name: toft
+          image: {{ include "toft.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: platform
+              containerPort: 8080
+            - name: callback
+              containerPort: 8082
+            {{- if $twoOrigin }}
+            - name: apps
+              containerPort: 8081
+            {{- end }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "toft.configMapName" . }}
+            - secretRef:
+                name: {{ include "toft.secretName" . }}
+          env:
+            # In-cluster: no KUBECONFIG, so the backend uses the service account
+            # mounted at the well-known path. This is the production shape and
+            # the reason nothing here carries a cluster credential.
+            #
+            # A runner and the SDKs reach the platform at the callback listener,
+            # which serves /api/v1/runner and /api/v1/app and nothing else and
+            # believes no X-Forwarded-* header; the NetworkPolicy admits the apps
+            # namespace to this port alone. :8080 is the ingress controller's,
+            # whose forwarded headers TRUSTED_PROXY_CIDRS believes.
+            - name: CALLBACK_ADDR
+              value: ":8082"
+            - name: CALLBACK_URL
+              value: http://{{ include "toft.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.callbackPort }}
+            # Shared-mode apps run as processes the shared-mode agent places
+            # inside this pod — that *is* what "Toft's own footprint" means.
+            # Isolated apps are placed in the apps namespace as their own pods.
+            - name: RUNTIME
+              value: agent
+            {{- if not .Values.postgres.enabled }}
+            # The managed database's URL, by the key the operator's Secret uses
+            # (external.databaseUrlKey). Named here rather than left to envFrom
+            # so a Secret that exports it under another key still works, and one
+            # that lacks it fails at pod start naming the key, not later naming
+            # the variable. env wins over envFrom for the same name.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "toft.secretName" . }}
+                  key: {{ .Values.external.databaseUrlKey | default "DATABASE_URL" | quote }}
+            {{- end }}
+            {{- if .Values.releases.enabled }}
+            # Release trees and job runs on their own volume (values: releases).
+            - name: APPS_DIR
+              value: /releases/apps
+            - name: JOB_RUN_DIR
+              value: /releases/job-runs
+            {{- end }}
+            {{- with .Values.encryptionKeyURI }}
+            # Presence decides the encryption backend: set, and the key that
+            # encrypts this install's secrets is wrapped by a key that never
+            # leaves the KMS. Never templated when empty, because an empty
+            # ENCRYPTION_KEY_URI and an absent one must mean the same thing.
+            - name: ENCRYPTION_KEY_URI
+              value: {{ . | quote }}
+            {{- end }}
+          securityContext:
+            # Root, and deliberately: the agent starts shared workloads as their
+            # per-app accounts, and NET_ADMIN installs the metadata firewall. This pod
+            # is the trusted half of the install; the untrusted half is every
+            # workload in the apps namespace, which runs as UID 10001 with all
+            # capabilities dropped and no service-account token.
+            runAsUser: 0
+            capabilities:
+              add: [NET_ADMIN]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: sa-token
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+            {{- if .Values.releases.enabled }}
+            - name: releases
+              mountPath: /releases
+            {{- end }}
+          # /api/v1/config needs no authentication, so it is a usable probe that
+          # does not depend on a session.
+          readinessProbe:
+            httpGet:
+              path: /api/v1/config
+              port: platform
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/v1/config
+              port: platform
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        # What automount would have mounted, at the path the in-cluster client
+        # reads, with the mode stated (see automountServiceAccountToken above).
+        - name: sa-token
+          projected:
+            defaultMode: 0600
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3607
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "toft.fullname" . }}-data
+          {{- else }}
+          emptyDir:
+            sizeLimit: {{ .Values.persistence.emptyDirSizeLimit }}
+          {{- end }}
+        {{- if .Values.releases.enabled }}
+        - name: releases
+          {{- if .Values.releases.ephemeral }}
+          ephemeral:
+            volumeClaimTemplate:
+              spec:
+                accessModes: [{{ .Values.releases.accessMode }}]
+                {{- if .Values.releases.storageClass }}
+                storageClassName: {{ .Values.releases.storageClass }}
+                {{- end }}
+                resources:
+                  requests:
+                    storage: {{ .Values.releases.size }}
+          {{- else }}
+          persistentVolumeClaim:
+            claimName: {{ include "toft.fullname" . }}-releases
+          {{- end }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

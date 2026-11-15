@@ -1,0 +1,75 @@
+{
+  "_comment": "TOFT_STORAGE as the four SDKs must read it: one raw value per case (null is the variable unset), and either the mounts that result or the refusal. Every SDK's suite reads this file — sdk/go/storage_env_vector_test.go, sdk/node/test/storage-env-vector.test.js, sdk/python/tests/test_storage_env_vector.py and, for R, sdk/storage_env_vector_r_test.go — so a language that drifts fails its own suite rather than a black-box run. The platform's kinds are volume and store, its access levels read, write and full (internal/database/storage.go, internal/runtime). Every refusal carries a non-empty hint. Changing an expectation here changes four SDKs; change it only with all four.",
+  "cases": [
+    {
+      "name": "unset",
+      "raw": null,
+      "mounts": []
+    },
+    {
+      "name": "blank",
+      "raw": "   ",
+      "mounts": []
+    },
+    {
+      "name": "empty list",
+      "raw": "[]",
+      "mounts": []
+    },
+    {
+      "name": "valid store",
+      "raw": "[{\"name\":\"warehouse\",\"kind\":\"store\",\"path\":\"/mnt/warehouse\",\"access\":\"write\"}]",
+      "mounts": [
+        {"name": "warehouse", "kind": "store", "path": "/mnt/warehouse", "access": "write", "folder": "", "read_only": false, "mounted": true}
+      ]
+    },
+    {
+      "name": "store reached by signed URL has no path",
+      "raw": "[{\"name\":\"warehouse\",\"kind\":\"store\",\"path\":\"\",\"access\":\"full\"}]",
+      "mounts": [
+        {"name": "warehouse", "kind": "store", "path": "", "access": "full", "folder": "", "read_only": false, "mounted": false}
+      ]
+    },
+    {
+      "name": "valid volume",
+      "raw": "[{\"name\":\"reports\",\"kind\":\"volume\",\"path\":\"/data/reports\",\"access\":\"read\"}]",
+      "mounts": [
+        {"name": "reports", "kind": "volume", "path": "/data/reports", "access": "read", "folder": "", "read_only": true, "mounted": true}
+      ]
+    },
+    {
+      "name": "volume with folder",
+      "raw": "[{\"name\":\"drop\",\"kind\":\"volume\",\"path\":\"/data/drop-backup\",\"access\":\"write\",\"folder\":\"backup\"}]",
+      "mounts": [
+        {"name": "drop", "kind": "volume", "path": "/data/drop-backup", "access": "write", "folder": "backup", "read_only": false, "mounted": true}
+      ]
+    },
+    {
+      "name": "two folders of one name",
+      "raw": "[{\"name\":\"drop\",\"kind\":\"volume\",\"path\":\"/data/drop\",\"access\":\"read\",\"folder\":\"\"},{\"name\":\"drop\",\"kind\":\"volume\",\"path\":\"/data/drop-in\",\"access\":\"write\",\"folder\":\"in\"}]",
+      "mounts": [
+        {"name": "drop", "kind": "volume", "path": "/data/drop", "access": "read", "folder": "", "read_only": true, "mounted": true},
+        {"name": "drop", "kind": "volume", "path": "/data/drop-in", "access": "write", "folder": "in", "read_only": false, "mounted": true}
+      ]
+    },
+    {"name": "not JSON", "raw": "[{name: reports}", "error": "storage_env_invalid"},
+    {"name": "JSON object, not a list", "raw": "{\"name\":\"reports\",\"kind\":\"volume\",\"path\":\"/data/reports\",\"access\":\"read\"}", "error": "storage_env_invalid"},
+    {"name": "empty JSON object, not a list", "raw": "{}", "error": "storage_env_invalid"},
+    {"name": "JSON number, not a list", "raw": "5", "error": "storage_env_invalid"},
+    {"name": "JSON string, not a list", "raw": "\"reports\"", "error": "storage_env_invalid"},
+    {"name": "JSON null, not a list", "raw": "null", "error": "storage_env_invalid"},
+    {"name": "number entry", "raw": "[5]", "error": "storage_env_invalid"},
+    {"name": "null entry", "raw": "[null]", "error": "storage_env_invalid"},
+    {"name": "string entry", "raw": "[\"x\"]", "error": "storage_env_invalid"},
+    {"name": "list entry", "raw": "[[]]", "error": "storage_env_invalid"},
+    {"name": "non-object entry beside a valid one", "raw": "[{\"name\":\"reports\",\"kind\":\"volume\",\"path\":\"/data/reports\",\"access\":\"read\"},5]", "error": "storage_env_invalid"},
+    {"name": "missing name", "raw": "[{\"kind\":\"volume\",\"path\":\"/data/reports\",\"access\":\"read\"}]", "error": "storage_env_invalid"},
+    {"name": "missing kind", "raw": "[{\"name\":\"reports\",\"path\":\"/data/reports\",\"access\":\"read\"}]", "error": "storage_env_invalid"},
+    {"name": "missing access", "raw": "[{\"name\":\"reports\",\"kind\":\"volume\",\"path\":\"/data/reports\"}]", "error": "storage_env_invalid"},
+    {"name": "empty name", "raw": "[{\"name\":\"\",\"kind\":\"volume\",\"path\":\"/data/reports\",\"access\":\"read\"}]", "error": "storage_env_invalid"},
+    {"name": "unknown kind", "raw": "[{\"name\":\"reports\",\"kind\":\"bogus\",\"path\":\"/data/reports\",\"access\":\"read\"}]", "error": "storage_env_invalid"},
+    {"name": "unknown access bogus", "raw": "[{\"name\":\"reports\",\"kind\":\"volume\",\"path\":\"/data/reports\",\"access\":\"bogus\"}]", "error": "storage_env_invalid"},
+    {"name": "unknown access readwrite", "raw": "[{\"name\":\"reports\",\"kind\":\"volume\",\"path\":\"/data/reports\",\"access\":\"readwrite\"}]", "error": "storage_env_invalid"},
+    {"name": "kind in the wrong case", "raw": "[{\"name\":\"reports\",\"kind\":\"Volume\",\"path\":\"/data/reports\",\"access\":\"read\"}]", "error": "storage_env_invalid"}
+  ]
+}

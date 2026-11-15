@@ -1,0 +1,244 @@
+/**
+ * The app's one JSON document — settings and small state that outlive a
+ * restart, a redeploy and a rollback, and belong to nobody's session.
+ *
+ *   const settings = (await toft.data.get()) ?? { period: "monthly" };
+ *   await toft.data.set({ ...settings, period });
+ *
+ * It sits between the two things that already existed and neither of which fits
+ * a handful of settings: `toft.scratchDir()` is wiped on every start, and mapped
+ * storage is durable but is an administrator's separate decision per app. This
+ * needs nothing switched on — every app has it, because it holds only what the
+ * app put there and reaches nothing outside the install.
+ *
+ * **One document, not a store.** No keys, no listing, no queries, and a cap of
+ * 256 KiB. An app with more than that has outgrown the feature rather than hit
+ * a limit worth raising, and the platform's refusal says so.
+ *
+ * **Never written and cleared are the same state, and both differ from `{}`.**
+ * `get()` answers `null` for either, which is why an app can write `{}` and
+ * mean it.
+ *
+ * **Two writers need `update()`.** A `set()` is last-write-wins, which is right
+ * for the single-writer app and silently loses a change when a job and the web
+ * process both save. `update()` reads, applies your change, and writes it back
+ * under the version it read — retrying if somebody got there first, so the
+ * other writer's change survives instead of being overwritten.
+ */
+
+import { ToftError, noMoreArgs, refusal, takeOptions, transport } from "./transport.js";
+
+/**
+ * The document changed under a write that named the version it meant to
+ * replace. Carries the version that *is* stored, so recovery is one read rather
+ * than a guess.
+ */
+export class VersionConflict extends ToftError {
+  constructor(message, options = {}) {
+    super(message, options);
+    this.name = "VersionConflict";
+    this.version = options.body?.version ?? 0;
+  }
+}
+
+/** How many times `update()` re-reads and re-applies before giving up. */
+// How long, in seconds, one update waits out rate-limit refusals in all —
+// apart from its attempts, which are conflicts. A count of waits gave up
+// after ~30 s however long the limiter asked for; the deadline is Python's
+// (RATE_LIMIT_TIMEOUT), so the three SDKs keep the same promise.
+export const RATE_LIMIT_TIMEOUT = 300;
+// The pause when a refusal names no Retry-After.
+const RATE_LIMIT_PAUSE = 1;
+const DEFAULT_ATTEMPTS = 5;
+
+/** One read of the document, with the platform's two facts about it. */
+export class Document {
+  constructor(raw) {
+    const data = raw ?? {};
+    /** The document, or `null` when the app has never written one. */
+    this.data = data.data ?? null;
+    /** 0 when nothing is stored; the compare-and-set token otherwise. */
+    this.version = data.version ?? 0;
+    /** When it was last written, or `null`. */
+    this.updatedAt = data.updated_at ?? null;
+    /** Its size in bytes, as the platform counted it against the cap. */
+    this.bytes = data.bytes ?? 0;
+  }
+
+  /** True when nothing has been saved, or it was cleared. */
+  get empty() {
+    return this.data === null;
+  }
+}
+
+/** The app's one JSON document. */
+export class Data {
+  /** The document, or `null` when the app has never written one. */
+  async get() {
+    noMoreArgs("data.get()", arguments, 0, "await toft.data.get()");
+    return (await this.read()).data;
+  }
+
+  /** The document *and* its version — what `update()` is built on. */
+  async read() {
+    noMoreArgs("data.read()", arguments, 0, "await toft.data.read()");
+    return new Document(await transport().get("/api/v1/app/data"));
+  }
+
+  /**
+   * Replace the document.
+   *
+   * `ifVersion` makes it conditional: the write happens only if that is still
+   * the stored version, and throws `VersionConflict` otherwise. `0` means "only
+   * if nothing is stored", which is how an app claims first write without a
+   * separate call.
+   */
+  async set(document, options) {
+    // Before anything else: `{ if_version: 3 }` dropped was an unconditional
+    // PUT, the concurrency guard its caller meant to keep gone without a word.
+    const { ifVersion } = takeOptions("data.set()", options, ["ifVersion"],
+      "toft.data.set(doc, { ifVersion: 3 })");
+    // The one thing checked locally, and not a duplicated platform limit: an
+    // `undefined` here would be serialized as `{}` and quietly wipe the app's
+    // settings, which is a wrong request rather than a refused one.
+    if (document === null || typeof document !== "object" || Array.isArray(document)) {
+      throw new ToftError(
+        "app data holds one JSON object — an array or a bare value has nowhere to " +
+          'grow a field later, so wrap it, e.g. { items: [...] }.',
+        { body: { code: "bad_request", retryable: false, hint: "wrap it in an object: { items: [...] }" } },
+      );
+    }
+    const headers = ifVersion === undefined ? undefined : { "If-Match": `"${ifVersion}"` };
+    const raw = await typed(() => transport().putJson("/api/v1/app/data", document, { headers }));
+    // **The write's answer carries what was written.** The platform's reply to
+    // a PUT is deliberately metadata only — version, timestamp, size — rather
+    // than the document echoed back, so without this the handle came back with
+    // `data: null`: the value this API reserves for "never written", handed to
+    // a caller who had just written. Filled from the document that went out
+    // rather than by a second read, which would cost a round trip and could
+    // answer with somebody else's later write.
+    const doc = new Document(raw);
+    doc.data = document;
+    return doc;
+  }
+
+  /**
+   * Read, change, write back — without losing a concurrent writer's change.
+   *
+   * `mutator` is given the current document (`{}` when there is none) and may
+   * either mutate it or return a replacement. The write is conditional on the
+   * version that was read, so if somebody else wrote in between, this re-reads
+   * and applies your change again rather than overwriting theirs.
+   *
+   *   await toft.data.update((s) => { s.runs = (s.runs ?? 0) + 1; });
+   *
+   * Use `read()`/`set()` directly when "there was nothing here" has to be told
+   * apart from "there was an empty document" — that distinction is the one
+   * thing `{}` papers over.
+   */
+  async update(mutator, options) {
+    const { attempts = DEFAULT_ATTEMPTS, rateLimitTimeout = RATE_LIMIT_TIMEOUT } = takeOptions(
+      "data.update()", options, ["attempts", "rateLimitTimeout"],
+      "toft.data.update(fn, { attempts: 5, rateLimitTimeout: 60 })");
+    // Before any request: `update("notfn")` read the document and then threw
+    // TypeError: mutator is not a function, uncoded (BB-008).
+    if (!Number.isInteger(attempts) || attempts < 1) {
+      throw refusal("bad_request", `attempts is a whole number from 1, got ${String(attempts)}`,
+        { hint: "update(fn, { attempts: 5 })" });
+    }
+    if (typeof mutator !== "function") {
+      throw refusal("bad_request",
+        `data.update() takes a function that is given the document, got ${mutator === null ? "null" : typeof mutator}`,
+        { hint: "toft.data.update((doc) => { doc.runs = (doc.runs ?? 0) + 1; })" });
+    }
+    if (typeof rateLimitTimeout !== "number" || !(rateLimitTimeout >= 0)) {
+      // A negative or NaN timeout was taken as 0 without a word.
+      throw refusal("bad_request",
+        `rateLimitTimeout is seconds to wait out rate_limited, 0 or more — got ${String(rateLimitTimeout)}`,
+        { hint: "update(fn, { rateLimitTimeout: 60 })" });
+    }
+    let last;
+    let conflicts = 0;
+    const giveUp = Date.now() + rateLimitTimeout * 1000;
+    // A rate-limit refusal is waited out and does not spend an attempt:
+    // several writers at once each read and re-read, and on the app's limiter
+    // (burst 10) the lost write was the update's own — the one thing this
+    // method promises not to lose. Retry-After is honoured, with a little
+    // jitter so writers refused together do not all return in the same
+    // instant; the waits have a deadline of their own, and past it the
+    // refusal itself is thrown, naming the limiter.
+    const limited = async (err) => {
+      const left = giveUp - Date.now();
+      if (!(err instanceof ToftError) || err.code !== "rate_limited" || left <= 0) {
+        throw err;
+      }
+      const pause = Math.max(err.retryAfter ?? RATE_LIMIT_PAUSE, 0) * 1000 + Math.random() * 250;
+      await new Promise((r) => setTimeout(r, Math.min(pause, left)));
+    };
+    while (conflicts < attempts) {
+      let current;
+      try {
+        current = await this.read();
+      } catch (err) {
+        await limited(err);
+        continue;
+      }
+      const working = current.data ?? {};
+      const next = (await mutator(working, current)) ?? working;
+      try {
+        return await this.set(next, { ifVersion: current.version });
+      } catch (err) {
+        if (err instanceof VersionConflict) {
+          last = err;
+          conflicts++;
+        } else await limited(err);
+      }
+    }
+    throw new ToftError(
+      `app data changed under ${attempts} attempts to update it — something is ` +
+        `writing it continuously`,
+      {
+        status: last?.status,
+        body: {
+          ...(last?.body ?? {}),
+          hint: last?.body?.hint ||
+            "another writer keeps changing the document — retry later, or pass a larger attempts",
+        },
+      },
+    );
+  }
+
+  /**
+   * Throw the document away, putting the app back to never-having-written one.
+   *
+   * Not the same as writing `{}`, deliberately: an app that cleared its settings
+   * and one that saved an empty object mean different things, and the next read
+   * tells them apart.
+   */
+  async clear(options) {
+    const { ifVersion } = takeOptions("data.clear()", options, ["ifVersion"],
+      "toft.data.clear({ ifVersion: 3 })");
+    const headers = ifVersion === undefined ? undefined : { "If-Match": `"${ifVersion}"` };
+    const raw = await typed(() => transport().del("/api/v1/app/data", headers));
+    return Boolean(raw?.deleted);
+  }
+}
+
+/**
+ * Give a failed precondition a type, so `update()` can retry it and app code
+ * can catch it, rather than matching on a status code.
+ */
+async function typed(call) {
+  try {
+    return await call();
+  } catch (err) {
+    if (err instanceof ToftError && err.code === "version_conflict") {
+      throw new VersionConflict(err.message, {
+        status: err.status,
+        retryAfter: err.retryAfter,
+        body: err.body,
+      });
+    }
+    throw err;
+  }
+}
